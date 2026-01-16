@@ -1,4 +1,4 @@
-// server.js - Railway Backend с Multi-Key Failover
+// server.js - Railway Backend с Multi-Key Failover + Standard API Keys
 const express = require('express');
 const cors = require('cors');
 
@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 3000;
 class APIKeyPool {
     constructor() {
         this.keys = [];
-        this.keyStatus = new Map(); // key -> { healthy, lastCheck, failCount, successCount }
+        this.keyStatus = new Map();
         this.currentIndex = 0;
         this._loadKeys();
         this._startHealthMonitor();
@@ -20,7 +20,6 @@ class APIKeyPool {
 
     _loadKeys() {
         // Загружаем ключи из environment variables
-        // OPENAI_API_KEY_1, OPENAI_API_KEY_2, etc.
         for (let i = 1; i <= 10; i++) {
             const key = process.env[`OPENAI_API_KEY_${i}`];
             if (key && key.startsWith('sk-')) {
@@ -35,7 +34,7 @@ class APIKeyPool {
             }
         }
 
-        // Fallback: если нет пронумерованных ключей, используем OPENAI_API_KEY
+        // Fallback
         if (this.keys.length === 0) {
             const fallbackKey = process.env.OPENAI_API_KEY;
             if (fallbackKey && fallbackKey.startsWith('sk-')) {
@@ -57,7 +56,6 @@ class APIKeyPool {
     }
 
     _startHealthMonitor() {
-        // Каждые 5 минут проверяем "мертвые" ключи
         setInterval(() => {
             this._checkUnhealthyKeys();
         }, 5 * 60 * 1000);
@@ -68,13 +66,11 @@ class APIKeyPool {
         
         for (const [key, status] of this.keyStatus.entries()) {
             if (!status.healthy) {
-                // Если ключ был мертв больше 10 минут, пробуем его восстановить
                 const minutesSinceCheck = (Date.now() - status.lastCheck) / 1000 / 60;
                 
                 if (minutesSinceCheck > 10) {
                     console.log(`🔄 Attempting to recover key: ${key.substring(0, 10)}...`);
                     
-                    // Пробуем простой запрос
                     try {
                         const response = await fetch('https://api.openai.com/v1/models', {
                             headers: { 'Authorization': `Bearer ${key}` }
@@ -105,7 +101,6 @@ class APIKeyPool {
             throw new Error('No healthy API keys available');
         }
 
-        // Round-robin: берем следующий здоровый ключ
         const key = healthyKeys[this.currentIndex % healthyKeys.length];
         this.currentIndex++;
         
@@ -120,7 +115,6 @@ class APIKeyPool {
         status.lastError = error.message;
         status.lastCheck = Date.now();
 
-        // Если ключ упал 3 раза подряд - помечаем как нездоровый
         if (status.failCount >= 3) {
             status.healthy = false;
             console.warn(`⚠️ Key marked as unhealthy after ${status.failCount} failures: ${key.substring(0, 10)}...`);
@@ -133,10 +127,9 @@ class APIKeyPool {
         if (!status) return;
 
         status.successCount++;
-        status.failCount = Math.max(0, status.failCount - 1); // Уменьшаем счетчик ошибок
+        status.failCount = Math.max(0, status.failCount - 1);
         status.lastCheck = Date.now();
         
-        // Если ключ был нездоровым, но сейчас сработал - восстанавливаем
         if (!status.healthy) {
             status.healthy = true;
             console.log(`✅ Key auto-recovered: ${key.substring(0, 10)}...`);
@@ -169,13 +162,12 @@ class APIKeyPool {
     }
 }
 
-// Инициализируем пул ключей
 const keyPool = new APIKeyPool();
 
 // Rate limiting storage
 const rateLimitStore = new Map();
 
-// CORS - разрешаем только твои домены
+// CORS
 const allowedOrigins = [
   'http://localhost:8000',
   'http://localhost:3000',
@@ -183,12 +175,10 @@ const allowedOrigins = [
   'https://cdpn.io',
   'https://codepen.io',
   'https://hypnologue.art',
-  // Добавь свои домены
 ];
 
 app.use(cors({
   origin: (origin, callback) => {
-    // Разрешаем requests без origin (например Postman)
     if (!origin) return callback(null, true);
     
     if (allowedOrigins.includes(origin)) {
@@ -203,18 +193,17 @@ app.use(cors({
 
 app.use(express.json());
 
-// Middleware для логирования
 app.use((req, res, next) => {
   console.log(`📨 ${req.method} ${req.path} from ${req.ip}`);
   next();
 });
 
-// Rate Limiter - базовая защита
+// Rate Limiter
 function checkRateLimit(ip, projectId) {
   const key = `${ip}:${projectId}`;
   const now = Date.now();
-  const windowMs = 60 * 60 * 1000; // 1 час
-  const maxRequests = 10; // 10 ключей в час
+  const windowMs = 60 * 60 * 1000;
+  const maxRequests = 10;
   
   if (!rateLimitStore.has(key)) {
     rateLimitStore.set(key, { count: 0, resetAt: now + windowMs });
@@ -222,7 +211,6 @@ function checkRateLimit(ip, projectId) {
   
   const data = rateLimitStore.get(key);
   
-  // Сброс если окно истекло
   if (now > data.resetAt) {
     data.count = 0;
     data.resetAt = now + windowMs;
@@ -246,11 +234,10 @@ function checkRateLimit(ip, projectId) {
   };
 }
 
-// Очистка старых записей каждые 5 минут
 setInterval(() => {
   const now = Date.now();
   for (const [key, data] of rateLimitStore.entries()) {
-    if (now > data.resetAt + 60000) { // +1 минута после истечения
+    if (now > data.resetAt + 60000) {
       rateLimitStore.delete(key);
     }
   }
@@ -262,18 +249,18 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'OpenAI Auth Gateway',
-    version: '1.0.0',
+    version: '2.0.0',
+    features: ['ephemeral-keys', 'standard-api-keys', 'multi-key-failover'],
     timestamp: new Date().toISOString()
   });
 });
 
-// Главный endpoint - генерация ephemeral key с Failover
+// 1️⃣ EPHEMERAL KEY для Realtime API
 app.post('/session', async (req, res) => {
     try {
         const { project, voice = 'shimmer', maxDuration = 300000 } = req.body;
         const clientIp = req.ip || req.connection.remoteAddress;
         
-        // Валидация
         if (!project) {
             return res.status(400).json({ 
                 error: 'Project ID required',
@@ -281,7 +268,6 @@ app.post('/session', async (req, res) => {
             });
         }
         
-        // Rate limiting
         const rateCheck = checkRateLimit(clientIp, project);
         if (!rateCheck.allowed) {
             return res.status(429).json({
@@ -291,7 +277,6 @@ app.post('/session', async (req, res) => {
             });
         }
         
-        // Проверка наличия ключей
         const healthyKeys = keyPool.getHealthyKeys();
         if (healthyKeys.length === 0) {
             console.error('❌ No healthy API keys available!');
@@ -301,12 +286,11 @@ app.post('/session', async (req, res) => {
             });
         }
         
-        console.log(`🔑 Attempting key generation for project: ${project}, voice: ${voice}`);
+        console.log(`🔑 Generating EPHEMERAL key for: ${project}, voice: ${voice}`);
         console.log(`📊 Healthy keys: ${healthyKeys.length}/${keyPool.keys.length}`);
         
-        // Пробуем ключи по очереди с failover
         let lastError = null;
-        const maxAttempts = Math.min(3, healthyKeys.length); // Максимум 3 попытки
+        const maxAttempts = Math.min(3, healthyKeys.length);
         
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
             const apiKey = keyPool.getNextKey();
@@ -334,13 +318,10 @@ app.post('/session', async (req, res) => {
                 
                 const data = await openaiResponse.json();
                 
-                // ✅ Успех! Помечаем ключ как рабочий
                 keyPool.markKeySuccess(apiKey);
                 
-                console.log(`✅ Key generated successfully with key: ${keyLabel}`);
-                console.log(`📊 Stats: ${keyPool.getStats().healthy} healthy keys`);
+                console.log(`✅ Ephemeral key generated with: ${keyLabel}`);
                 
-                // Возвращаем данные клиенту
                 return res.json({
                     ephemeralKey: data.client_secret.value,
                     expiresAt: data.client_secret.expires_at,
@@ -351,7 +332,6 @@ app.post('/session', async (req, res) => {
                         remaining: rateCheck.remaining,
                         resetAt: rateCheck.resetAt
                     },
-                    // Дополнительная информация для мониторинга
                     _meta: {
                         keyUsed: keyLabel,
                         attempt: attempt + 1,
@@ -362,11 +342,8 @@ app.post('/session', async (req, res) => {
             } catch (error) {
                 lastError = error;
                 console.error(`❌ Attempt ${attempt + 1} failed with key ${keyLabel}:`, error.message);
-                
-                // Помечаем ключ как проблемный
                 keyPool.markKeyFailed(apiKey, error);
                 
-                // Если есть еще попытки - продолжаем
                 if (attempt < maxAttempts - 1) {
                     console.log(`🔄 Trying next key...`);
                     continue;
@@ -374,7 +351,6 @@ app.post('/session', async (req, res) => {
             }
         }
         
-        // Если все попытки провалились
         console.error('❌ All failover attempts exhausted');
         return res.status(503).json({
             error: 'Failed to generate session key after multiple attempts',
@@ -394,7 +370,62 @@ app.post('/session', async (req, res) => {
     }
 });
 
-// Analytics endpoint (простой пример)
+// 2️⃣ STANDARD API KEY для обычных запросов
+app.post('/api-key', async (req, res) => {
+    try {
+        const { project } = req.body;
+        const clientIp = req.ip || req.connection.remoteAddress;
+        
+        if (!project) {
+            return res.status(400).json({ 
+                error: 'Project ID required',
+                code: 'MISSING_PROJECT'
+            });
+        }
+        
+        const rateCheck = checkRateLimit(clientIp, project);
+        if (!rateCheck.allowed) {
+            return res.status(429).json({
+                error: rateCheck.message,
+                code: 'RATE_LIMIT_EXCEEDED',
+                resetIn: rateCheck.resetIn
+            });
+        }
+        
+        const healthyKeys = keyPool.getHealthyKeys();
+        if (healthyKeys.length === 0) {
+            return res.status(503).json({ 
+                error: 'No healthy API keys',
+                code: 'NO_HEALTHY_KEYS'
+            });
+        }
+        
+        const apiKey = keyPool.getNextKey();
+        const keyLabel = `${apiKey.substring(0, 10)}...${apiKey.substring(apiKey.length - 4)}`;
+        
+        console.log(`🔑 Standard API key provided: ${keyLabel} for ${project}`);
+        
+        res.json({
+            apiKey: apiKey,
+            keyLabel: keyLabel,
+            project: project,
+            rateLimit: {
+                remaining: rateCheck.remaining,
+                resetAt: rateCheck.resetAt
+            }
+        });
+        
+    } catch (error) {
+        console.error('❌ Error providing API key:', error);
+        res.status(500).json({
+            error: 'Internal server error',
+            code: 'INTERNAL_ERROR',
+            message: error.message
+        });
+    }
+});
+
+// Analytics
 app.get('/analytics', (req, res) => {
     const stats = {
         activeConnections: rateLimitStore.size,
@@ -409,7 +440,7 @@ app.get('/analytics', (req, res) => {
     res.json(stats);
 });
 
-// 🔥 НОВЫЙ: Мониторинг состояния API ключей
+// Keys health
 app.get('/keys/health', (req, res) => {
     const stats = keyPool.getStats();
     
@@ -425,7 +456,7 @@ app.get('/keys/health', (req, res) => {
     });
 });
 
-// 🔥 НОВЫЙ: Принудительная проверка всех ключей
+// Manual health check
 app.post('/keys/check', async (req, res) => {
     const { adminKey } = req.body;
     
@@ -475,7 +506,7 @@ app.post('/keys/check', async (req, res) => {
     });
 });
 
-// 🔥 НОВЫЙ: Восстановление конкретного ключа
+// Recover key
 app.post('/keys/recover', async (req, res) => {
     const { adminKey, keyIndex } = req.body;
     
@@ -490,7 +521,6 @@ app.post('/keys/recover', async (req, res) => {
     const key = keyPool.keys[keyIndex];
     const status = keyPool.keyStatus.get(key);
     
-    // Сбрасываем счетчики
     status.failCount = 0;
     status.healthy = true;
     status.lastCheck = Date.now();
@@ -504,11 +534,10 @@ app.post('/keys/recover', async (req, res) => {
     });
 });
 
-// Admin endpoint - очистить rate limits (для emergency)
+// Reset rate limits
 app.post('/admin/reset-limits', (req, res) => {
   const { adminKey } = req.body;
   
-  // Простая защита (в продакшене используй proper auth)
   if (adminKey !== process.env.ADMIN_KEY) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
@@ -522,13 +551,14 @@ app.post('/admin/reset-limits', (req, res) => {
   });
 });
 
-// 404 handler
+// 404
 app.use((req, res) => {
   res.status(404).json({ 
     error: 'Endpoint not found',
     availableEndpoints: [
       'GET /',
       'POST /session',
+      'POST /api-key',
       'GET /analytics',
       'GET /keys/health',
       'POST /keys/check',
@@ -548,7 +578,7 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(PORT, () => {
-    console.log('🚀 OpenAI Auth Gateway with Multi-Key Failover');
+    console.log('🚀 OpenAI Auth Gateway v2.0');
     console.log(`📡 Server running on port ${PORT}`);
     console.log(`🔑 API Keys: ${keyPool.keys.length} loaded`);
     console.log(`   Healthy: ${keyPool.getHealthyKeys().length}`);
@@ -556,17 +586,16 @@ app.listen(PORT, () => {
     console.log(`🛡️ CORS enabled for: ${allowedOrigins.join(', ')}`);
     console.log(`⏰ Time: ${new Date().toISOString()}`);
     console.log(`\n📊 Endpoints:`);
-    console.log(`   POST /session          - Generate ephemeral key`);
-    console.log(`   GET  /analytics        - Rate limit stats`);
-    console.log(`   GET  /keys/health      - API keys health status`);
-    console.log(`   POST /keys/check       - Manual health check (admin)`);
-    console.log(`   POST /keys/recover     - Recover specific key (admin)`);
-    console.log(`   POST /admin/reset-limits - Reset rate limits (admin)`);
+    console.log(`   POST /session              - Generate ephemeral key (Realtime API)`);
+    console.log(`   POST /api-key              - Get standard API key`);
+    console.log(`   GET  /analytics            - Rate limit stats`);
+    console.log(`   GET  /keys/health          - API keys health status`);
+    console.log(`   POST /keys/check           - Manual health check (admin)`);
+    console.log(`   POST /keys/recover         - Recover specific key (admin)`);
+    console.log(`   POST /admin/reset-limits   - Reset rate limits (admin)`);
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('👋 SIGTERM received, shutting down gracefully');
   process.exit(0);
 });
-
