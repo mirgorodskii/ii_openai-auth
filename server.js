@@ -1,7 +1,6 @@
 // server.js - Railway Backend с Multi-Key Failover
 const express = require('express');
 const cors = require('cors');
-const rateLimit = require('express-rate-limit');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -181,6 +180,8 @@ const allowedOrigins = [
   'http://localhost:8000',
   'http://localhost:3000',
   'https://yourdomain.com',
+  'https://cdpn.io',
+  'https://codepen.io',
   // Добавь свои домены
 ];
 
@@ -265,107 +266,241 @@ app.get('/', (req, res) => {
   });
 });
 
-// Главный endpoint - генерация ephemeral key
+// Главный endpoint - генерация ephemeral key с Failover
 app.post('/session', async (req, res) => {
-  try {
-    const { project, voice = 'shimmer', maxDuration = 300000 } = req.body;
-    const clientIp = req.ip || req.connection.remoteAddress;
-    
-    // Валидация
-    if (!project) {
-      return res.status(400).json({ 
-        error: 'Project ID required',
-        code: 'MISSING_PROJECT'
-      });
+    try {
+        const { project, voice = 'shimmer', maxDuration = 300000 } = req.body;
+        const clientIp = req.ip || req.connection.remoteAddress;
+        
+        // Валидация
+        if (!project) {
+            return res.status(400).json({ 
+                error: 'Project ID required',
+                code: 'MISSING_PROJECT'
+            });
+        }
+        
+        // Rate limiting
+        const rateCheck = checkRateLimit(clientIp, project);
+        if (!rateCheck.allowed) {
+            return res.status(429).json({
+                error: rateCheck.message,
+                code: 'RATE_LIMIT_EXCEEDED',
+                resetIn: rateCheck.resetIn
+            });
+        }
+        
+        // Проверка наличия ключей
+        const healthyKeys = keyPool.getHealthyKeys();
+        if (healthyKeys.length === 0) {
+            console.error('❌ No healthy API keys available!');
+            return res.status(503).json({ 
+                error: 'Service temporarily unavailable - no healthy API keys',
+                code: 'NO_HEALTHY_KEYS'
+            });
+        }
+        
+        console.log(`🔑 Attempting key generation for project: ${project}, voice: ${voice}`);
+        console.log(`📊 Healthy keys: ${healthyKeys.length}/${keyPool.keys.length}`);
+        
+        // Пробуем ключи по очереди с failover
+        let lastError = null;
+        const maxAttempts = Math.min(3, healthyKeys.length); // Максимум 3 попытки
+        
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            const apiKey = keyPool.getNextKey();
+            const keyLabel = `${apiKey.substring(0, 10)}...${apiKey.substring(apiKey.length - 4)}`;
+            
+            try {
+                console.log(`🔄 Attempt ${attempt + 1}/${maxAttempts} with key: ${keyLabel}`);
+                
+                const openaiResponse = await fetch('https://api.openai.com/v1/realtime/sessions', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${apiKey}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        model: 'gpt-4o-realtime-preview-2024-12-17',
+                        voice: voice
+                    })
+                });
+                
+                if (!openaiResponse.ok) {
+                    const errorText = await openaiResponse.text();
+                    throw new Error(`OpenAI API error: ${openaiResponse.status} - ${errorText}`);
+                }
+                
+                const data = await openaiResponse.json();
+                
+                // ✅ Успех! Помечаем ключ как рабочий
+                keyPool.markKeySuccess(apiKey);
+                
+                console.log(`✅ Key generated successfully with key: ${keyLabel}`);
+                console.log(`📊 Stats: ${keyPool.getStats().healthy} healthy keys`);
+                
+                // Возвращаем данные клиенту
+                return res.json({
+                    ephemeralKey: data.client_secret.value,
+                    expiresAt: data.client_secret.expires_at,
+                    maxDuration: maxDuration,
+                    project: project,
+                    voice: voice,
+                    rateLimit: {
+                        remaining: rateCheck.remaining,
+                        resetAt: rateCheck.resetAt
+                    },
+                    // Дополнительная информация для мониторинга
+                    _meta: {
+                        keyUsed: keyLabel,
+                        attempt: attempt + 1,
+                        healthyKeys: keyPool.getHealthyKeys().length
+                    }
+                });
+                
+            } catch (error) {
+                lastError = error;
+                console.error(`❌ Attempt ${attempt + 1} failed with key ${keyLabel}:`, error.message);
+                
+                // Помечаем ключ как проблемный
+                keyPool.markKeyFailed(apiKey, error);
+                
+                // Если есть еще попытки - продолжаем
+                if (attempt < maxAttempts - 1) {
+                    console.log(`🔄 Trying next key...`);
+                    continue;
+                }
+            }
+        }
+        
+        // Если все попытки провалились
+        console.error('❌ All failover attempts exhausted');
+        return res.status(503).json({
+            error: 'Failed to generate session key after multiple attempts',
+            code: 'ALL_KEYS_FAILED',
+            details: lastError?.message,
+            healthyKeys: keyPool.getHealthyKeys().length,
+            totalKeys: keyPool.keys.length
+        });
+        
+    } catch (error) {
+        console.error('❌ Server error:', error);
+        res.status(500).json({
+            error: 'Internal server error',
+            code: 'INTERNAL_ERROR',
+            message: error.message
+        });
     }
-    
-    // Rate limiting
-    const rateCheck = checkRateLimit(clientIp, project);
-    if (!rateCheck.allowed) {
-      return res.status(429).json({
-        error: rateCheck.message,
-        code: 'RATE_LIMIT_EXCEEDED',
-        resetIn: rateCheck.resetIn
-      });
-    }
-    
-    // Проверка API ключа
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) {
-      console.error('❌ OPENAI_API_KEY not configured');
-      return res.status(500).json({ 
-        error: 'Server configuration error',
-        code: 'MISSING_API_KEY'
-      });
-    }
-    
-    // Запрос ephemeral key от OpenAI
-    console.log(`🔑 Generating key for project: ${project}, voice: ${voice}`);
-    
-    const openaiResponse = await fetch('https://api.openai.com/v1/realtime/sessions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o-realtime-preview-2024-12-17',
-        voice: voice
-      })
-    });
-    
-    if (!openaiResponse.ok) {
-      const errorText = await openaiResponse.text();
-      console.error('❌ OpenAI API error:', openaiResponse.status, errorText);
-      
-      return res.status(openaiResponse.status).json({
-        error: 'Failed to generate session key',
-        code: 'OPENAI_API_ERROR',
-        details: errorText
-      });
-    }
-    
-    const data = await openaiResponse.json();
-    
-    // Логирование для аналитики
-    console.log(`✅ Key generated for ${project} | Remaining: ${rateCheck.remaining}`);
-    
-    // Возвращаем данные клиенту
-    res.json({
-      ephemeralKey: data.client_secret.value,
-      expiresAt: data.client_secret.expires_at,
-      maxDuration: maxDuration,
-      project: project,
-      voice: voice,
-      rateLimit: {
-        remaining: rateCheck.remaining,
-        resetAt: rateCheck.resetAt
-      }
-    });
-    
-  } catch (error) {
-    console.error('❌ Server error:', error);
-    res.status(500).json({
-      error: 'Internal server error',
-      code: 'INTERNAL_ERROR',
-      message: error.message
-    });
-  }
 });
 
 // Analytics endpoint (простой пример)
 app.get('/analytics', (req, res) => {
-  const stats = {
-    activeConnections: rateLimitStore.size,
-    timestamp: new Date().toISOString(),
-    rateLimits: Array.from(rateLimitStore.entries()).map(([key, data]) => ({
-      key,
-      count: data.count,
-      resetAt: new Date(data.resetAt).toISOString()
-    }))
-  };
-  
-  res.json(stats);
+    const stats = {
+        activeConnections: rateLimitStore.size,
+        timestamp: new Date().toISOString(),
+        rateLimits: Array.from(rateLimitStore.entries()).map(([key, data]) => ({
+            key,
+            count: data.count,
+            resetAt: new Date(data.resetAt).toISOString()
+        }))
+    };
+    
+    res.json(stats);
+});
+
+// 🔥 НОВЫЙ: Мониторинг состояния API ключей
+app.get('/keys/health', (req, res) => {
+    const stats = keyPool.getStats();
+    
+    res.json({
+        timestamp: new Date().toISOString(),
+        summary: {
+            total: stats.total,
+            healthy: stats.healthy,
+            unhealthy: stats.unhealthy,
+            healthPercentage: ((stats.healthy / stats.total) * 100).toFixed(1) + '%'
+        },
+        keys: stats.keys
+    });
+});
+
+// 🔥 НОВЫЙ: Принудительная проверка всех ключей
+app.post('/keys/check', async (req, res) => {
+    const { adminKey } = req.body;
+    
+    if (adminKey !== process.env.ADMIN_KEY) {
+        return res.status(403).json({ error: 'Unauthorized' });
+    }
+    
+    console.log('🏥 Manual health check initiated...');
+    
+    const results = [];
+    
+    for (const key of keyPool.keys) {
+        const keyLabel = `${key.substring(0, 10)}...${key.substring(key.length - 4)}`;
+        
+        try {
+            const response = await fetch('https://api.openai.com/v1/models', {
+                headers: { 'Authorization': `Bearer ${key}` }
+            });
+            
+            const isHealthy = response.ok;
+            const status = keyPool.keyStatus.get(key);
+            status.healthy = isHealthy;
+            status.lastCheck = Date.now();
+            
+            results.push({
+                key: keyLabel,
+                status: isHealthy ? 'healthy' : 'unhealthy',
+                httpStatus: response.status
+            });
+            
+            console.log(`${isHealthy ? '✅' : '❌'} ${keyLabel}: ${response.status}`);
+            
+        } catch (error) {
+            results.push({
+                key: keyLabel,
+                status: 'error',
+                error: error.message
+            });
+            console.log(`❌ ${keyLabel}: ${error.message}`);
+        }
+    }
+    
+    res.json({
+        message: 'Health check completed',
+        results: results,
+        summary: keyPool.getStats()
+    });
+});
+
+// 🔥 НОВЫЙ: Восстановление конкретного ключа
+app.post('/keys/recover', async (req, res) => {
+    const { adminKey, keyIndex } = req.body;
+    
+    if (adminKey !== process.env.ADMIN_KEY) {
+        return res.status(403).json({ error: 'Unauthorized' });
+    }
+    
+    if (keyIndex < 0 || keyIndex >= keyPool.keys.length) {
+        return res.status(400).json({ error: 'Invalid key index' });
+    }
+    
+    const key = keyPool.keys[keyIndex];
+    const status = keyPool.keyStatus.get(key);
+    
+    // Сбрасываем счетчики
+    status.failCount = 0;
+    status.healthy = true;
+    status.lastCheck = Date.now();
+    
+    console.log(`🔄 Key ${keyIndex} manually recovered`);
+    
+    res.json({
+        message: 'Key recovered',
+        keyIndex: keyIndex,
+        status: status
+    });
 });
 
 // Admin endpoint - очистить rate limits (для emergency)
@@ -394,6 +529,9 @@ app.use((req, res) => {
       'GET /',
       'POST /session',
       'GET /analytics',
+      'GET /keys/health',
+      'POST /keys/check',
+      'POST /keys/recover',
       'POST /admin/reset-limits'
     ]
   });
@@ -409,11 +547,20 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(PORT, () => {
-  console.log('🚀 OpenAI Auth Gateway started');
-  console.log(`📡 Server running on port ${PORT}`);
-  console.log(`🔑 API key configured: ${process.env.OPENAI_API_KEY ? 'YES' : 'NO'}`);
-  console.log(`🛡️ CORS enabled for: ${allowedOrigins.join(', ')}`);
-  console.log(`⏰ Time: ${new Date().toISOString()}`);
+    console.log('🚀 OpenAI Auth Gateway with Multi-Key Failover');
+    console.log(`📡 Server running on port ${PORT}`);
+    console.log(`🔑 API Keys: ${keyPool.keys.length} loaded`);
+    console.log(`   Healthy: ${keyPool.getHealthyKeys().length}`);
+    console.log(`   Strategy: Round-robin with automatic failover`);
+    console.log(`🛡️ CORS enabled for: ${allowedOrigins.join(', ')}`);
+    console.log(`⏰ Time: ${new Date().toISOString()}`);
+    console.log(`\n📊 Endpoints:`);
+    console.log(`   POST /session          - Generate ephemeral key`);
+    console.log(`   GET  /analytics        - Rate limit stats`);
+    console.log(`   GET  /keys/health      - API keys health status`);
+    console.log(`   POST /keys/check       - Manual health check (admin)`);
+    console.log(`   POST /keys/recover     - Recover specific key (admin)`);
+    console.log(`   POST /admin/reset-limits - Reset rate limits (admin)`);
 });
 
 // Graceful shutdown
