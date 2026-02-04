@@ -1,4 +1,4 @@
-// server.js - Railway Backend с Multi-Key Failover (5 попыток)
+// server.js - Railway Backend с Multi-Key Failover (6 попыток)
 const express = require('express');
 const cors = require('cors');
 
@@ -242,14 +242,14 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'OpenAI Auth Gateway',
-    version: '2.1.0',
+    version: '2.2.0',
     features: ['ephemeral-keys', 'standard-api-keys', 'multi-key-failover'],
-    maxAttempts: 5,
+    maxAttempts: 6,
     timestamp: new Date().toISOString()
   });
 });
 
-// 1️⃣ EPHEMERAL KEY для Realtime API (5 ПОПЫТОК!)
+// 1️⃣ EPHEMERAL KEY для Realtime API (6 ПОПЫТОК!)
 app.post('/session', async (req, res) => {
     try {
         const { project, voice = 'shimmer', maxDuration = 300000 } = req.body;
@@ -284,7 +284,7 @@ app.post('/session', async (req, res) => {
         console.log(`📊 Healthy keys: ${healthyKeys.length}/${keyPool.keys.length}`);
         
         let lastError = null;
-        const maxAttempts = Math.min(5, healthyKeys.length);  // 👈 5 ПОПЫТОК!
+        const maxAttempts = Math.min(6, healthyKeys.length);  // 👈 6 ПОПЫТОК!
         
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
             const apiKey = keyPool.getNextKey();
@@ -567,15 +567,15 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(PORT, () => {
-    console.log('🚀 OpenAI Auth Gateway v2.1 (5 Attempts)');
+    console.log('🚀 OpenAI Auth Gateway v2.2 (6 Attempts)');
     console.log(`📡 Server running on port ${PORT}`);
     console.log(`🔑 API Keys: ${keyPool.keys.length} loaded`);
     console.log(`   Healthy: ${keyPool.getHealthyKeys().length}`);
-    console.log(`   Strategy: Round-robin with automatic failover (5 attempts)`);
+    console.log(`   Strategy: Round-robin with automatic failover (6 attempts)`);
     console.log(`🛡️ CORS enabled for: ${allowedOrigins.join(', ')}`);
     console.log(`⏰ Time: ${new Date().toISOString()}`);
     console.log(`\n📊 Endpoints:`);
-    console.log(`   POST /session              - Generate ephemeral key (5 attempts)`);
+    console.log(`   POST /session              - Generate ephemeral key (6 attempts)`);
     console.log(`   POST /api-key              - Get standard API key`);
     console.log(`   GET  /analytics            - Rate limit stats`);
     console.log(`   GET  /keys/health          - API keys health status`);
