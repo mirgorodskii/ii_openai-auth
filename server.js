@@ -1,4 +1,4 @@
-// server.js - Railway Backend с Multi-Key Failover + Standard API Keys
+// server.js - Railway Backend с Multi-Key Failover (5 попыток)
 const express = require('express');
 const cors = require('cors');
 
@@ -19,7 +19,6 @@ class APIKeyPool {
     }
 
     _loadKeys() {
-        // Загружаем ключи из environment variables
         for (let i = 1; i <= 10; i++) {
             const key = process.env[`OPENAI_API_KEY_${i}`];
             if (key && key.startsWith('sk-')) {
@@ -34,7 +33,6 @@ class APIKeyPool {
             }
         }
 
-        // Fallback
         if (this.keys.length === 0) {
             const fallbackKey = process.env.OPENAI_API_KEY;
             if (fallbackKey && fallbackKey.startsWith('sk-')) {
@@ -163,11 +161,8 @@ class APIKeyPool {
 }
 
 const keyPool = new APIKeyPool();
-
-// Rate limiting storage
 const rateLimitStore = new Map();
 
-// CORS
 const allowedOrigins = [
   'http://localhost:8000',
   'http://localhost:3000',
@@ -198,7 +193,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Rate Limiter
 function checkRateLimit(ip, projectId) {
   const key = `${ip}:${projectId}`;
   const now = Date.now();
@@ -244,18 +238,18 @@ setInterval(() => {
   console.log('🧹 Cleanup: rate limit store size:', rateLimitStore.size);
 }, 5 * 60 * 1000);
 
-// Health check
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'OpenAI Auth Gateway',
-    version: '2.0.0',
+    version: '2.1.0',
     features: ['ephemeral-keys', 'standard-api-keys', 'multi-key-failover'],
+    maxAttempts: 5,
     timestamp: new Date().toISOString()
   });
 });
 
-// 1️⃣ EPHEMERAL KEY для Realtime API
+// 1️⃣ EPHEMERAL KEY для Realtime API (5 ПОПЫТОК!)
 app.post('/session', async (req, res) => {
     try {
         const { project, voice = 'shimmer', maxDuration = 300000 } = req.body;
@@ -290,7 +284,7 @@ app.post('/session', async (req, res) => {
         console.log(`📊 Healthy keys: ${healthyKeys.length}/${keyPool.keys.length}`);
         
         let lastError = null;
-        const maxAttempts = Math.min(3, healthyKeys.length);
+        const maxAttempts = Math.min(5, healthyKeys.length);  // 👈 5 ПОПЫТОК!
         
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
             const apiKey = keyPool.getNextKey();
@@ -320,7 +314,7 @@ app.post('/session', async (req, res) => {
                 
                 keyPool.markKeySuccess(apiKey);
                 
-                console.log(`✅ Ephemeral key generated with: ${keyLabel}`);
+                console.log(`✅ Ephemeral key generated with: ${keyLabel} on attempt ${attempt + 1}`);
                 
                 return res.json({
                     ephemeralKey: data.client_secret.value,
@@ -335,6 +329,7 @@ app.post('/session', async (req, res) => {
                     _meta: {
                         keyUsed: keyLabel,
                         attempt: attempt + 1,
+                        maxAttempts: maxAttempts,
                         healthyKeys: keyPool.getHealthyKeys().length
                     }
                 });
@@ -351,13 +346,14 @@ app.post('/session', async (req, res) => {
             }
         }
         
-        console.error('❌ All failover attempts exhausted');
+        console.error(`❌ All ${maxAttempts} failover attempts exhausted`);
         return res.status(503).json({
-            error: 'Failed to generate session key after multiple attempts',
+            error: `Failed to generate session key after ${maxAttempts} attempts`,
             code: 'ALL_KEYS_FAILED',
             details: lastError?.message,
             healthyKeys: keyPool.getHealthyKeys().length,
-            totalKeys: keyPool.keys.length
+            totalKeys: keyPool.keys.length,
+            attempts: maxAttempts
         });
         
     } catch (error) {
@@ -370,7 +366,7 @@ app.post('/session', async (req, res) => {
     }
 });
 
-// 2️⃣ STANDARD API KEY для обычных запросов
+// 2️⃣ STANDARD API KEY
 app.post('/api-key', async (req, res) => {
     try {
         const { project } = req.body;
@@ -425,7 +421,6 @@ app.post('/api-key', async (req, res) => {
     }
 });
 
-// Analytics
 app.get('/analytics', (req, res) => {
     const stats = {
         activeConnections: rateLimitStore.size,
@@ -440,7 +435,6 @@ app.get('/analytics', (req, res) => {
     res.json(stats);
 });
 
-// Keys health
 app.get('/keys/health', (req, res) => {
     const stats = keyPool.getStats();
     
@@ -456,7 +450,6 @@ app.get('/keys/health', (req, res) => {
     });
 });
 
-// Manual health check
 app.post('/keys/check', async (req, res) => {
     const { adminKey } = req.body;
     
@@ -506,7 +499,6 @@ app.post('/keys/check', async (req, res) => {
     });
 });
 
-// Recover key
 app.post('/keys/recover', async (req, res) => {
     const { adminKey, keyIndex } = req.body;
     
@@ -534,7 +526,6 @@ app.post('/keys/recover', async (req, res) => {
     });
 });
 
-// Reset rate limits
 app.post('/admin/reset-limits', (req, res) => {
   const { adminKey } = req.body;
   
@@ -551,7 +542,6 @@ app.post('/admin/reset-limits', (req, res) => {
   });
 });
 
-// 404
 app.use((req, res) => {
   res.status(404).json({ 
     error: 'Endpoint not found',
@@ -568,7 +558,6 @@ app.use((req, res) => {
   });
 });
 
-// Error handler
 app.use((err, req, res, next) => {
   console.error('❌ Unhandled error:', err);
   res.status(500).json({ 
@@ -578,15 +567,15 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(PORT, () => {
-    console.log('🚀 OpenAI Auth Gateway v2.0');
+    console.log('🚀 OpenAI Auth Gateway v2.1 (5 Attempts)');
     console.log(`📡 Server running on port ${PORT}`);
     console.log(`🔑 API Keys: ${keyPool.keys.length} loaded`);
     console.log(`   Healthy: ${keyPool.getHealthyKeys().length}`);
-    console.log(`   Strategy: Round-robin with automatic failover`);
+    console.log(`   Strategy: Round-robin with automatic failover (5 attempts)`);
     console.log(`🛡️ CORS enabled for: ${allowedOrigins.join(', ')}`);
     console.log(`⏰ Time: ${new Date().toISOString()}`);
     console.log(`\n📊 Endpoints:`);
-    console.log(`   POST /session              - Generate ephemeral key (Realtime API)`);
+    console.log(`   POST /session              - Generate ephemeral key (5 attempts)`);
     console.log(`   POST /api-key              - Get standard API key`);
     console.log(`   GET  /analytics            - Rate limit stats`);
     console.log(`   GET  /keys/health          - API keys health status`);
