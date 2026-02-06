@@ -134,6 +134,39 @@ class APIKeyPool {
         }
     }
 
+    // 🆕 НОВЫЙ МЕТОД: Поиск ключа по label
+    findKeyByLabel(keyLabel) {
+        for (const key of this.keys) {
+            const label = `${key.substring(0, 10)}...${key.substring(key.length - 4)}`;
+            if (label === keyLabel) {
+                return key;
+            }
+        }
+        return null;
+    }
+
+    // 🆕 НОВЫЙ МЕТОД: Blacklist ключа по label
+    blacklistKey(keyLabel, reason) {
+        const key = this.findKeyByLabel(keyLabel);
+        if (!key) {
+            console.warn(`⚠️ Key not found for blacklist: ${keyLabel}`);
+            return false;
+        }
+
+        const status = this.keyStatus.get(key);
+        if (!status) return false;
+
+        status.healthy = false;
+        status.failCount = 999;
+        status.lastError = reason;
+        status.lastCheck = Date.now();
+
+        console.warn(`🚫 Key blacklisted: ${keyLabel}`);
+        console.warn(`   Reason: ${reason}`);
+        
+        return true;
+    }
+
     getStats() {
         const stats = {
             total: this.keys.length,
@@ -242,8 +275,8 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'OpenAI Auth Gateway',
-    version: '2.2.0',
-    features: ['ephemeral-keys', 'standard-api-keys', 'multi-key-failover'],
+    version: '2.3.0',
+    features: ['ephemeral-keys', 'standard-api-keys', 'multi-key-failover', 'client-blacklist'],
     maxAttempts: 6,
     timestamp: new Date().toISOString()
   });
@@ -284,7 +317,7 @@ app.post('/session', async (req, res) => {
         console.log(`📊 Healthy keys: ${healthyKeys.length}/${keyPool.keys.length}`);
         
         let lastError = null;
-        const maxAttempts = Math.min(6, healthyKeys.length);  // 👈 6 ПОПЫТОК!
+        const maxAttempts = Math.min(6, healthyKeys.length);
         
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
             const apiKey = keyPool.getNextKey();
@@ -421,6 +454,53 @@ app.post('/api-key', async (req, res) => {
     }
 });
 
+// 🆕 3️⃣ BLACKLIST KEY (Client-reported failures)
+app.post('/session/blacklist', (req, res) => {
+    try {
+        const { keyLabel, reason } = req.body;
+        
+        if (!keyLabel) {
+            return res.status(400).json({
+                error: 'keyLabel is required',
+                code: 'MISSING_KEY_LABEL'
+            });
+        }
+        
+        if (!reason) {
+            return res.status(400).json({
+                error: 'reason is required',
+                code: 'MISSING_REASON'
+            });
+        }
+        
+        const success = keyPool.blacklistKey(keyLabel, reason);
+        
+        if (!success) {
+            return res.status(404).json({
+                error: 'Key not found',
+                code: 'KEY_NOT_FOUND',
+                keyLabel: keyLabel
+            });
+        }
+        
+        res.json({
+            success: true,
+            message: 'Key blacklisted successfully',
+            keyLabel: keyLabel,
+            reason: reason,
+            healthyKeys: keyPool.getHealthyKeys().length
+        });
+        
+    } catch (error) {
+        console.error('❌ Error blacklisting key:', error);
+        res.status(500).json({
+            error: 'Internal server error',
+            code: 'INTERNAL_ERROR',
+            message: error.message
+        });
+    }
+});
+
 app.get('/analytics', (req, res) => {
     const stats = {
         activeConnections: rateLimitStore.size,
@@ -549,6 +629,7 @@ app.use((req, res) => {
       'GET /',
       'POST /session',
       'POST /api-key',
+      'POST /session/blacklist',
       'GET /analytics',
       'GET /keys/health',
       'POST /keys/check',
@@ -567,7 +648,7 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(PORT, () => {
-    console.log('🚀 OpenAI Auth Gateway v2.2 (6 Attempts)');
+    console.log('🚀 OpenAI Auth Gateway v2.3 (6 Attempts + Client Blacklist)');
     console.log(`📡 Server running on port ${PORT}`);
     console.log(`🔑 API Keys: ${keyPool.keys.length} loaded`);
     console.log(`   Healthy: ${keyPool.getHealthyKeys().length}`);
@@ -577,6 +658,7 @@ app.listen(PORT, () => {
     console.log(`\n📊 Endpoints:`);
     console.log(`   POST /session              - Generate ephemeral key (6 attempts)`);
     console.log(`   POST /api-key              - Get standard API key`);
+    console.log(`   POST /session/blacklist    - Blacklist bad key (client-reported)`);
     console.log(`   GET  /analytics            - Rate limit stats`);
     console.log(`   GET  /keys/health          - API keys health status`);
     console.log(`   POST /keys/check           - Manual health check (admin)`);
