@@ -202,6 +202,7 @@ const allowedOrigins = [
   'https://yourdomain.com',
   'https://cdpn.io',
   'https://codepen.io',
+  'https://*.codepen.dev',
   'https://hypnologue.art',
 ];
 
@@ -670,3 +671,4 @@ process.on('SIGTERM', () => {
   console.log('👋 SIGTERM received, shutting down gracefully');
   process.exit(0);
 });
+
