@@ -1,5 +1,6 @@
 // server.js - Railway Backend with Multi-Key Failover
 // Updated for OpenAI Realtime client_secrets flow
+// Fix: voice is NOT session.voice. It goes into session.audio.output.voice.
 
 const express = require('express');
 const cors = require('cors');
@@ -8,7 +9,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ============================================
-// API KEYS POOL with Failover & Load Balancing
+// API KEYS POOL
 // ============================================
 
 class APIKeyPool {
@@ -19,6 +20,10 @@ class APIKeyPool {
 
     this._loadKeys();
     this._startHealthMonitor();
+  }
+
+  _labelKey(key) {
+    return `${key.substring(0, 10)}...${key.substring(key.length - 4)}`;
   }
 
   _loadKeys() {
@@ -59,10 +64,6 @@ class APIKeyPool {
     });
   }
 
-  _labelKey(key) {
-    return `${key.substring(0, 10)}...${key.substring(key.length - 4)}`;
-  }
-
   _startHealthMonitor() {
     setInterval(() => {
       this._checkUnhealthyKeys();
@@ -86,21 +87,25 @@ class APIKeyPool {
               }
             });
 
+            const text = await response.text();
+
             if (response.ok) {
               status.healthy = true;
               status.failCount = 0;
               status.lastCheck = Date.now();
               status.lastError = null;
+
               console.log(`✅ Key recovered: ${this._labelKey(key)}`);
             } else {
-              const text = await response.text();
               status.lastError = `Health check failed: ${response.status} - ${text}`;
               status.lastCheck = Date.now();
+
               console.log(`❌ Key still unhealthy: ${this._labelKey(key)} | ${response.status}`);
             }
           } catch (error) {
             status.lastError = error.message;
             status.lastCheck = Date.now();
+
             console.log(`❌ Key still dead: ${this._labelKey(key)} | ${error.message}`);
           }
         }
@@ -138,6 +143,7 @@ class APIKeyPool {
 
     if (status.failCount >= 3) {
       status.healthy = false;
+
       console.warn(`⚠️ Key marked unhealthy after ${status.failCount} failures: ${this._labelKey(key)}`);
       console.warn(`   Last error: ${error.message}`);
     }
@@ -237,10 +243,10 @@ function isAllowedOrigin(origin) {
 
   if (allowedOrigins.includes(origin)) return true;
 
-  // Allow CodePen dev subdomains
+  // CodePen dynamic domains
   if (/^https:\/\/.*\.codepen\.dev$/.test(origin)) return true;
 
-  // Optional: allow Railway preview / deployed frontend if needed
+  // Railway frontend previews, if you ever use them
   if (/^https:\/\/.*\.up\.railway\.app$/.test(origin)) return true;
 
   return false;
@@ -276,9 +282,6 @@ function checkRateLimit(ip, projectId) {
   const now = Date.now();
 
   const windowMs = 60 * 60 * 1000;
-
-  // For production maybe 10.
-  // For debugging keep this higher, because the frontend retries several times.
   const maxRequests = Number(process.env.RATE_LIMIT_MAX || 100);
 
   if (!rateLimitStore.has(key)) {
@@ -369,10 +372,24 @@ async function createRealtimeClientSecret(apiKey, options = {}) {
     instructions = null
   } = options;
 
+  // Important:
+  // Do NOT use session.voice.
+  // The API rejected it with: Unknown parameter: 'session.voice'.
   const session = {
     type: 'realtime',
     model,
-    voice
+
+    audio: {
+      output: {
+        voice
+      },
+
+      input: {
+        turn_detection: {
+          type: 'server_vad'
+        }
+      }
+    }
   };
 
   if (instructions && typeof instructions === 'string') {
@@ -393,6 +410,7 @@ async function createRealtimeClientSecret(apiKey, options = {}) {
   const rawText = await response.text();
 
   let data = null;
+
   try {
     data = rawText ? JSON.parse(rawText) : null;
   } catch (error) {
@@ -436,13 +454,14 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'OpenAI Auth Gateway',
-    version: '3.0.0',
+    version: '3.1.0',
     features: [
       'realtime-client-secrets',
       'ephemeral-keys',
       'multi-key-failover',
       'client-blacklist',
-      'debug-details'
+      'debug-details',
+      'fixed-audio-output-voice'
     ],
     model: process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime',
     keysLoaded: keyPool.keys.length,
@@ -451,7 +470,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// 1️⃣ EPHEMERAL KEY for Realtime API
+// 1️⃣ EPHEMERAL KEY FOR REALTIME API
 app.post('/session', async (req, res) => {
   try {
     const {
@@ -583,9 +602,8 @@ app.post('/session', async (req, res) => {
 });
 
 // 2️⃣ STANDARD API KEY
-// Warning: this exposes a full API key to the browser.
-// Keep only if you really need it for your private installation/debugging.
-// For public production, avoid this endpoint.
+// Warning: this exposes a full OpenAI API key to the browser.
+// Keep only for private debugging. Avoid for public production.
 app.post('/api-key', async (req, res) => {
   try {
     const { project } = req.body || {};
@@ -642,7 +660,7 @@ app.post('/api-key', async (req, res) => {
   }
 });
 
-// 3️⃣ BLACKLIST KEY - client-reported failures
+// 3️⃣ BLACKLIST KEY
 app.post('/session/blacklist', (req, res) => {
   try {
     const { keyLabel, reason } = req.body || {};
@@ -879,7 +897,7 @@ app.use((err, req, res, next) => {
 // ============================================
 
 app.listen(PORT, () => {
-  console.log('🚀 OpenAI Auth Gateway v3.0 - Realtime client_secrets');
+  console.log('🚀 OpenAI Auth Gateway v3.1 - Realtime client_secrets');
   console.log(`📡 Server running on port ${PORT}`);
   console.log(`🔑 API Keys loaded: ${keyPool.keys.length}`);
   console.log(`✅ Healthy keys: ${keyPool.getHealthyKeys().length}`);
