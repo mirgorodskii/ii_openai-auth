@@ -357,6 +357,30 @@ function normalizeVoice(voice) {
   return 'shimmer';
 }
 
+function normalizeRealtimeModel(model) {
+  const allowedModels = new Set([
+    'gpt-realtime-2.1',
+    'gpt-realtime-2.1-mini',
+    'gpt-realtime-2',
+    'gpt-realtime-1.5',
+    'gpt-realtime-mini',
+    'gpt-realtime'
+  ]);
+
+  const fallbackModel = process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime-2.1';
+
+  if (!model || typeof model !== 'string') return fallbackModel;
+
+  const normalized = model.trim();
+
+  if (allowedModels.has(normalized)) {
+    return normalized;
+  }
+
+  console.warn(`⚠️ Unknown Realtime model "${model}", falling back to ${fallbackModel}`);
+  return fallbackModel;
+}
+
 function shouldExposeDebug(req) {
   return (
     process.env.NODE_ENV !== 'production' ||
@@ -368,7 +392,7 @@ function shouldExposeDebug(req) {
 async function createRealtimeClientSecret(apiKey, options = {}) {
   const {
     voice = 'shimmer',
-    model = process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime',
+    model = process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime-2.1',
     instructions = null
   } = options;
 
@@ -463,7 +487,7 @@ app.get('/', (req, res) => {
       'debug-details',
       'fixed-audio-output-voice'
     ],
-    model: process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime',
+    model: process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime-2.1',
     keysLoaded: keyPool.keys.length,
     healthyKeys: keyPool.getHealthyKeys().length,
     timestamp: new Date().toISOString()
@@ -476,6 +500,7 @@ app.post('/session', async (req, res) => {
     const {
       project,
       voice = 'shimmer',
+      model = null,
       maxDuration = 300000,
       instructions = null
     } = req.body || {};
@@ -490,6 +515,7 @@ app.post('/session', async (req, res) => {
     }
 
     const normalizedVoice = normalizeVoice(voice);
+    const normalizedModel = normalizeRealtimeModel(model);
 
     const rateCheck = checkRateLimit(clientIp, project);
 
@@ -514,6 +540,7 @@ app.post('/session', async (req, res) => {
 
     console.log(`🔑 Generating Realtime client secret for project: ${project}`);
     console.log(`🎙️ Voice: ${normalizedVoice}`);
+    console.log(`🧠 Model: ${normalizedModel}`);
     console.log(`📊 Healthy keys: ${healthyKeys.length}/${keyPool.keys.length}`);
 
     let lastError = null;
@@ -528,7 +555,7 @@ app.post('/session', async (req, res) => {
 
         const result = await createRealtimeClientSecret(apiKey, {
           voice: normalizedVoice,
-          model: process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime',
+          model: normalizedModel,
           instructions
         });
 
