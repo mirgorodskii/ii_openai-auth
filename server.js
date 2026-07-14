@@ -930,7 +930,7 @@ app.listen(PORT, () => {
   console.log(`📡 Server running on port ${PORT}`);
   console.log(`🔑 API Keys loaded: ${keyPool.keys.length}`);
   console.log(`✅ Healthy keys: ${keyPool.getHealthyKeys().length}`);
-  console.log(`🧠 Realtime model: ${process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime'}`);
+  console.log(`🧠 Realtime model: ${process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime-2.1'}`);
   console.log(`🛡️ CORS enabled for: ${allowedOrigins.join(', ')}`);
   console.log(`⏰ Time: ${new Date().toISOString()}`);
 
