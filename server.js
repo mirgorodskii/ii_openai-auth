@@ -340,9 +340,11 @@ function normalizeVoice(voice) {
     'ballad',
     'coral',
     'echo',
+    'marin',
     'sage',
     'shimmer',
-    'verse'
+    'verse',
+    'cedar'
   ]);
 
   if (!voice || typeof voice !== 'string') return 'shimmer';
