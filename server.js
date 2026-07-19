@@ -361,8 +361,6 @@ function normalizeVoice(voice) {
 
 function normalizeRealtimeModel(model) {
   const allowedModels = new Set([
-    'gpt-4o-realtime-preview',
-    'gpt-4o-mini-realtime-preview',
     'gpt-realtime',
     'gpt-realtime-mini',
     'gpt-realtime-1.5',
@@ -518,8 +516,8 @@ app.post('/session', async (req, res) => {
       });
     }
 
-    const normalizedVoice = normalizeVoice(voice);
     const normalizedModel = normalizeRealtimeModel(model);
+    const normalizedVoice = normalizeVoice(voice);
 
     const rateCheck = checkRateLimit(clientIp, project);
 
