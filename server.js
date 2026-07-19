@@ -361,12 +361,14 @@ function normalizeVoice(voice) {
 
 function normalizeRealtimeModel(model) {
   const allowedModels = new Set([
-    'gpt-realtime-2.1',
-    'gpt-realtime-2.1-mini',
-    'gpt-realtime-2',
-    'gpt-realtime-1.5',
+    'gpt-4o-realtime-preview',
+    'gpt-4o-mini-realtime-preview',
+    'gpt-realtime',
     'gpt-realtime-mini',
-    'gpt-realtime'
+    'gpt-realtime-1.5',
+    'gpt-realtime-2',
+    'gpt-realtime-2.1-mini',
+    'gpt-realtime-2.1'
   ]);
 
   const fallbackModel = process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime-2.1';
