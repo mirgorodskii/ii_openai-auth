@@ -503,7 +503,60 @@ const DEFAULT_SCENARIO_TEMPLATE = [
   'Repeat ===PHASE=== blocks as needed. Make every phase playable and ensure all user rules are reflected.'
 ].join('\n');
 
-async function generateScenario(apiKey, rules, templatePrompt, safetyIdentifier) {
+function parseVariableLists(text) {
+  const lists = [];
+  let current = null;
+
+  for (const rawLine of text.replace(/\r\n?/g, '\n').split('\n')) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    const heading = line.match(/^\d+\.\s+(.+)$/);
+    if (heading) {
+      current = { name: heading[1].trim(), values: [] };
+      lists.push(current);
+      continue;
+    }
+    if (!current) continue;
+
+    const bullet = line.match(/^[-*]\s+(.+)$/);
+    if (bullet) {
+      current.values.push(bullet[1].trim());
+      continue;
+    }
+
+    // Also handles compact prose such as "For each phase define: - A - B - C".
+    const inlineValues = line.split(/\s+-\s+/).slice(1).map((value) => value.trim()).filter(Boolean);
+    if (inlineValues.length) current.values.push(...inlineValues);
+  }
+
+  return lists.filter((list) => list.values.length > 0);
+}
+
+function buildVariableInstructions(variableListsText) {
+  const lists = parseVariableLists(variableListsText);
+  if (!lists.length) return '';
+
+  const formattedLists = lists
+    .map((list) => `[${list.name}]\n${list.values.map((value) => `- ${value}`).join('\n')}`)
+    .join('\n\n');
+
+  return [
+    'VARIABLE-LIST REQUIREMENTS:',
+    'Treat every numbered section below as one variable category and its bullets as available options or required fields.',
+    'Choose a coherent combination rather than copying every option into the scenario.',
+    'Inside <BACKBONE>, explicitly state the chosen Scenario Development Approach, all resolved General Scenario Variables, and the selected signs that make this unlike a typical AI conversation.',
+    'Use one Conversation Opening Approach in the first phase.',
+    'Use one or more Ways to Elicit a Response in every phase.',
+    'Create exactly six ===PHASE=== blocks. In each phase instructions, explicitly define every item from the Six-Phase Command Template.',
+    'The selected variables must actively affect the dialogue and progression, not appear as decorative metadata.',
+    '',
+    formattedLists
+  ].join('\n');
+}
+
+async function generateScenario(apiKey, rules, templatePrompt, variableListsText, safetyIdentifier) {
+  const variableInstructions = buildVariableInstructions(variableListsText);
   const response = await fetch('https://api.openai.com/v1/responses', {
     method: 'POST',
     headers: {
@@ -515,7 +568,9 @@ async function generateScenario(apiKey, rules, templatePrompt, safetyIdentifier)
       reasoning: { effort: 'medium' },
       store: false,
       safety_identifier: safetyIdentifier,
-      instructions: templatePrompt,
+      instructions: variableInstructions
+        ? `${templatePrompt}\n\n${variableInstructions}`
+        : templatePrompt,
       input: rules,
       max_output_tokens: 12000
     })
@@ -704,6 +759,9 @@ app.post('/generate-scenario', async (req, res) => {
     ? req.body.templatePrompt.trim()
     : '';
   const templatePrompt = suppliedTemplate || DEFAULT_SCENARIO_TEMPLATE;
+  const variableListsText = typeof req.body?.variableLists === 'string'
+    ? req.body.variableLists.trim()
+    : '';
   const clientIp = req.ip || req.connection.remoteAddress || 'unknown';
 
   if (!rules) {
@@ -714,6 +772,9 @@ app.post('/generate-scenario', async (req, res) => {
   }
   if (templatePrompt.length > 20000) {
     return res.status(400).json({ error: 'Template prompt is too long', code: 'TEMPLATE_TOO_LONG' });
+  }
+  if (variableListsText.length > 30000) {
+    return res.status(400).json({ error: 'Variable lists are too long', code: 'VARIABLE_LISTS_TOO_LONG' });
   }
 
   const rateCheck = checkRateLimit(clientIp, 'scenario-generator');
@@ -740,7 +801,13 @@ app.post('/generate-scenario', async (req, res) => {
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const apiKey = keyPool.getNextKey();
     try {
-      const result = await generateScenario(apiKey, rules, templatePrompt, safetyIdentifier);
+      const result = await generateScenario(
+        apiKey,
+        rules,
+        templatePrompt,
+        variableListsText,
+        safetyIdentifier
+      );
       keyPool.markKeySuccess(apiKey);
       return res.json({
         scenario: result.scenario,
