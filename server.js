@@ -4,6 +4,7 @@
 
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -472,6 +473,70 @@ async function createRealtimeClientSecret(apiKey, options = {}) {
   };
 }
 
+function extractResponseText(data) {
+  return (data?.output || [])
+    .filter((item) => item?.type === 'message')
+    .flatMap((item) => item.content || [])
+    .filter((part) => part?.type === 'output_text' && typeof part.text === 'string')
+    .map((part) => part.text)
+    .join('\n')
+    .trim();
+}
+
+async function generateScenario(apiKey, rules, safetyIdentifier) {
+  const response = await fetch('https://api.openai.com/v1/responses', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      model: 'gpt-5.6-sol',
+      reasoning: { effort: 'medium' },
+      store: false,
+      safety_identifier: safetyIdentifier,
+      instructions: [
+        'Create one complete interactive voice-performance scenario for The Phone application.',
+        'Return only the scenario text. Do not use Markdown fences or add commentary.',
+        'The output must use exactly this editable format:',
+        'name: Scenario name',
+        'voice: one of alloy, ash, ballad, coral, echo, marin, sage, shimmer, verse, cedar',
+        '',
+        '<BACKBONE>',
+        'Global rules that apply throughout the entire experience.',
+        '</BACKBONE>',
+        '',
+        '===PHASE===',
+        'temperature: number from 0 to 1',
+        'duration: positive number of assistant responses',
+        'nudge: optional short trigger; omit the line when unnecessary',
+        'instructions: phase instructions',
+        '',
+        'Repeat ===PHASE=== blocks as needed. Make every phase playable and ensure all user rules are reflected.'
+      ].join('\n'),
+      input: rules,
+      max_output_tokens: 12000
+    })
+  });
+
+  const rawText = await response.text();
+  let data;
+  try {
+    data = rawText ? JSON.parse(rawText) : null;
+  } catch (error) {
+    throw new Error(`OpenAI returned non-JSON response: ${response.status}`);
+  }
+
+  if (!response.ok) {
+    throw new Error(`OpenAI API error: ${response.status} - ${JSON.stringify(data)}`);
+  }
+
+  const scenario = extractResponseText(data);
+  if (!scenario) throw new Error('OpenAI returned an empty scenario');
+
+  return { scenario, responseId: data.id || null, usage: data.usage || null };
+}
+
 // ============================================
 // ROUTES
 // ============================================
@@ -630,7 +695,66 @@ app.post('/session', async (req, res) => {
   }
 });
 
-// 2️⃣ STANDARD API KEY
+// 2️⃣ SCENARIO GENERATOR (server-side Responses API; API key is never exposed)
+app.post('/generate-scenario', async (req, res) => {
+  const rules = typeof req.body?.rules === 'string' ? req.body.rules.trim() : '';
+  const clientIp = req.ip || req.connection.remoteAddress || 'unknown';
+
+  if (!rules) {
+    return res.status(400).json({ error: 'Generation rules are required', code: 'MISSING_RULES' });
+  }
+  if (rules.length > 20000) {
+    return res.status(400).json({ error: 'Generation rules are too long', code: 'RULES_TOO_LONG' });
+  }
+
+  const rateCheck = checkRateLimit(clientIp, 'scenario-generator');
+  if (!rateCheck.allowed) {
+    return res.status(429).json({
+      error: rateCheck.message,
+      code: 'RATE_LIMIT_EXCEEDED',
+      resetIn: rateCheck.resetIn
+    });
+  }
+
+  const healthyKeys = keyPool.getHealthyKeys();
+  if (healthyKeys.length === 0) {
+    return res.status(503).json({ error: 'No healthy API keys', code: 'NO_HEALTHY_KEYS' });
+  }
+
+  const safetyIdentifier = crypto
+    .createHash('sha256')
+    .update(`scenario-generator:${clientIp}`)
+    .digest('hex');
+  const maxAttempts = Math.min(3, healthyKeys.length);
+  let lastError = null;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const apiKey = keyPool.getNextKey();
+    try {
+      const result = await generateScenario(apiKey, rules, safetyIdentifier);
+      keyPool.markKeySuccess(apiKey);
+      return res.json({
+        scenario: result.scenario,
+        model: 'gpt-5.6-sol',
+        responseId: result.responseId,
+        usage: result.usage,
+        rateLimit: { remaining: rateCheck.remaining, resetAt: rateCheck.resetAt }
+      });
+    } catch (error) {
+      lastError = error;
+      keyPool.markKeyFailed(apiKey, error);
+      console.error(`❌ Scenario generation attempt ${attempt + 1} failed: ${error.message}`);
+    }
+  }
+
+  return res.status(503).json({
+    error: 'Scenario generation failed',
+    code: 'GENERATION_FAILED',
+    details: lastError?.message || null
+  });
+});
+
+// 3️⃣ STANDARD API KEY
 // Warning: this exposes a full OpenAI API key to the browser.
 // Keep only for private debugging. Avoid for public production.
 app.post('/api-key', async (req, res) => {
@@ -901,6 +1025,7 @@ app.use((req, res) => {
     availableEndpoints: [
       'GET /',
       'POST /session',
+      'POST /generate-scenario',
       'POST /api-key',
       'POST /session/blacklist',
       'GET /analytics',
@@ -937,6 +1062,7 @@ app.listen(PORT, () => {
   console.log('\n📊 Endpoints:');
   console.log('   GET  /                       - Service status');
   console.log('   POST /session                - Generate Realtime ephemeral key');
+  console.log('   POST /generate-scenario      - Generate scenario with GPT-5.6 Sol');
   console.log('   POST /api-key                - Get standard API key');
   console.log('   POST /session/blacklist      - Blacklist bad key');
   console.log('   GET  /analytics              - Rate limit stats');
