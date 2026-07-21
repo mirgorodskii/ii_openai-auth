@@ -483,7 +483,27 @@ function extractResponseText(data) {
     .trim();
 }
 
-async function generateScenario(apiKey, rules, safetyIdentifier) {
+const DEFAULT_SCENARIO_TEMPLATE = [
+  'Create one complete interactive voice-performance scenario for The Phone application.',
+  'Return only the scenario text. Do not use Markdown fences or add commentary.',
+  'The output must use exactly this editable format:',
+  'name: Scenario name',
+  'voice: one of alloy, ash, ballad, coral, echo, marin, sage, shimmer, verse, cedar',
+  '',
+  '<BACKBONE>',
+  'Global rules that apply throughout the entire experience.',
+  '</BACKBONE>',
+  '',
+  '===PHASE===',
+  'temperature: number from 0 to 1',
+  'duration: positive number of assistant responses',
+  'nudge: optional short trigger; omit the line when unnecessary',
+  'instructions: phase instructions',
+  '',
+  'Repeat ===PHASE=== blocks as needed. Make every phase playable and ensure all user rules are reflected.'
+].join('\n');
+
+async function generateScenario(apiKey, rules, templatePrompt, safetyIdentifier) {
   const response = await fetch('https://api.openai.com/v1/responses', {
     method: 'POST',
     headers: {
@@ -495,25 +515,7 @@ async function generateScenario(apiKey, rules, safetyIdentifier) {
       reasoning: { effort: 'medium' },
       store: false,
       safety_identifier: safetyIdentifier,
-      instructions: [
-        'Create one complete interactive voice-performance scenario for The Phone application.',
-        'Return only the scenario text. Do not use Markdown fences or add commentary.',
-        'The output must use exactly this editable format:',
-        'name: Scenario name',
-        'voice: one of alloy, ash, ballad, coral, echo, marin, sage, shimmer, verse, cedar',
-        '',
-        '<BACKBONE>',
-        'Global rules that apply throughout the entire experience.',
-        '</BACKBONE>',
-        '',
-        '===PHASE===',
-        'temperature: number from 0 to 1',
-        'duration: positive number of assistant responses',
-        'nudge: optional short trigger; omit the line when unnecessary',
-        'instructions: phase instructions',
-        '',
-        'Repeat ===PHASE=== blocks as needed. Make every phase playable and ensure all user rules are reflected.'
-      ].join('\n'),
+      instructions: templatePrompt,
       input: rules,
       max_output_tokens: 12000
     })
@@ -698,6 +700,10 @@ app.post('/session', async (req, res) => {
 // 2️⃣ SCENARIO GENERATOR (server-side Responses API; API key is never exposed)
 app.post('/generate-scenario', async (req, res) => {
   const rules = typeof req.body?.rules === 'string' ? req.body.rules.trim() : '';
+  const suppliedTemplate = typeof req.body?.templatePrompt === 'string'
+    ? req.body.templatePrompt.trim()
+    : '';
+  const templatePrompt = suppliedTemplate || DEFAULT_SCENARIO_TEMPLATE;
   const clientIp = req.ip || req.connection.remoteAddress || 'unknown';
 
   if (!rules) {
@@ -705,6 +711,9 @@ app.post('/generate-scenario', async (req, res) => {
   }
   if (rules.length > 20000) {
     return res.status(400).json({ error: 'Generation rules are too long', code: 'RULES_TOO_LONG' });
+  }
+  if (templatePrompt.length > 20000) {
+    return res.status(400).json({ error: 'Template prompt is too long', code: 'TEMPLATE_TOO_LONG' });
   }
 
   const rateCheck = checkRateLimit(clientIp, 'scenario-generator');
@@ -731,7 +740,7 @@ app.post('/generate-scenario', async (req, res) => {
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const apiKey = keyPool.getNextKey();
     try {
-      const result = await generateScenario(apiKey, rules, safetyIdentifier);
+      const result = await generateScenario(apiKey, rules, templatePrompt, safetyIdentifier);
       keyPool.markKeySuccess(apiKey);
       return res.json({
         scenario: result.scenario,
