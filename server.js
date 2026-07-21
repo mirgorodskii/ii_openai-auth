@@ -583,26 +583,37 @@ async function generateScenario(
   templatePrompt,
   variableListsText,
   requestedSelections,
+  referenceScenario,
   safetyIdentifier
 ) {
   const variableConfig = buildVariableInstructions(variableListsText, requestedSelections);
+  const instructionParts = [];
+  if (templatePrompt) instructionParts.push(templatePrompt);
+  if (variableConfig.instructions) instructionParts.push(variableConfig.instructions);
+  if (referenceScenario) {
+    instructionParts.push([
+      'REFERENCE SCENARIO:',
+      'Use the following scenario only as a reference for approximate length and level of detail. Do not copy its story, wording, characters, or unique ideas.',
+      referenceScenario
+    ].join('\n'));
+  }
+  const instructions = instructionParts.join('\n\n');
+  const requestBody = {
+    model: 'gpt-5.6-sol',
+    reasoning: { effort: 'medium' },
+    store: false,
+    safety_identifier: safetyIdentifier,
+    input: rules || 'Generate one complete interactive voice scenario.',
+    max_output_tokens: 12000
+  };
+  if (instructions) requestBody.instructions = instructions;
   const response = await fetch('https://api.openai.com/v1/responses', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${apiKey}`,
       'Content-Type': 'application/json'
     },
-    body: JSON.stringify({
-      model: 'gpt-5.6-sol',
-      reasoning: { effort: 'medium' },
-      store: false,
-      safety_identifier: safetyIdentifier,
-      instructions: variableConfig.instructions
-        ? `${templatePrompt}\n\n${variableConfig.instructions}`
-        : templatePrompt,
-      input: rules,
-      max_output_tokens: 12000
-    })
+    body: JSON.stringify(requestBody)
   });
 
   const rawText = await response.text();
@@ -789,21 +800,20 @@ app.post('/session', async (req, res) => {
 // 2️⃣ SCENARIO GENERATOR (server-side Responses API; API key is never exposed)
 app.post('/generate-scenario', async (req, res) => {
   const rules = typeof req.body?.rules === 'string' ? req.body.rules.trim() : '';
-  const suppliedTemplate = typeof req.body?.templatePrompt === 'string'
+  const templatePrompt = typeof req.body?.templatePrompt === 'string'
     ? req.body.templatePrompt.trim()
     : '';
-  const templatePrompt = suppliedTemplate || DEFAULT_SCENARIO_TEMPLATE;
   const variableListsText = typeof req.body?.variableLists === 'string'
     ? req.body.variableLists.trim()
     : '';
   const variableSelections = req.body?.variableSelections && typeof req.body.variableSelections === 'object'
     ? req.body.variableSelections
     : {};
+  const referenceScenario = typeof req.body?.referenceScenario === 'string'
+    ? req.body.referenceScenario.trim()
+    : '';
   const clientIp = req.ip || req.connection.remoteAddress || 'unknown';
 
-  if (!rules) {
-    return res.status(400).json({ error: 'Generation rules are required', code: 'MISSING_RULES' });
-  }
   if (rules.length > 20000) {
     return res.status(400).json({ error: 'Generation rules are too long', code: 'RULES_TOO_LONG' });
   }
@@ -812,6 +822,9 @@ app.post('/generate-scenario', async (req, res) => {
   }
   if (variableListsText.length > 30000) {
     return res.status(400).json({ error: 'Variable lists are too long', code: 'VARIABLE_LISTS_TOO_LONG' });
+  }
+  if (referenceScenario.length > 50000) {
+    return res.status(400).json({ error: 'Reference scenario is too long', code: 'REFERENCE_TOO_LONG' });
   }
 
   const rateCheck = checkRateLimit(clientIp, 'scenario-generator');
@@ -844,6 +857,7 @@ app.post('/generate-scenario', async (req, res) => {
         templatePrompt,
         variableListsText,
         variableSelections,
+        referenceScenario,
         safetyIdentifier
       );
       keyPool.markKeySuccess(apiKey);
