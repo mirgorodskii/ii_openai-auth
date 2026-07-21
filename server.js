@@ -533,30 +533,59 @@ function parseVariableLists(text) {
   return lists.filter((list) => list.values.length > 0);
 }
 
-function buildVariableInstructions(variableListsText) {
+function buildVariableInstructions(variableListsText, requestedSelections = {}) {
   const lists = parseVariableLists(variableListsText);
-  if (!lists.length) return '';
+  if (!lists.length) return { instructions: '', selections: {} };
+
+  const selections = {};
+  for (const list of lists) {
+    const requested = typeof requestedSelections?.[list.name] === 'string'
+      ? requestedSelections[list.name]
+      : '__random__';
+    const selected = requested !== '__random__' && list.values.includes(requested)
+      ? requested
+      : list.values[crypto.randomInt(list.values.length)];
+    selections[list.name] = selected;
+  }
 
   const formattedLists = lists
     .map((list) => `[${list.name}]\n${list.values.map((value) => `- ${value}`).join('\n')}`)
     .join('\n\n');
 
-  return [
+  const resolvedSelections = Object.entries(selections)
+    .map(([name, value]) => `- ${name}: ${value}`)
+    .join('\n');
+
+  return {
+    selections,
+    instructions: [
     'VARIABLE-LIST REQUIREMENTS:',
     'Treat every numbered section below as one variable category and its bullets as available options or required fields.',
-    'Choose a coherent combination rather than copying every option into the scenario.',
+    'Use the resolved selection for every category. Random-mode choices have already been selected for this request.',
     'Inside <BACKBONE>, explicitly state the chosen Scenario Development Approach, all resolved General Scenario Variables, and the selected signs that make this unlike a typical AI conversation.',
     'Use one Conversation Opening Approach in the first phase.',
     'Use one or more Ways to Elicit a Response in every phase.',
     'Create exactly six ===PHASE=== blocks. In each phase instructions, explicitly define every item from the Six-Phase Command Template.',
     'The selected variables must actively affect the dialogue and progression, not appear as decorative metadata.',
     '',
+    'RESOLVED VARIABLE SELECTIONS:',
+    resolvedSelections,
+    '',
+    'AVAILABLE VARIABLE LISTS:',
     formattedLists
-  ].join('\n');
+    ].join('\n')
+  };
 }
 
-async function generateScenario(apiKey, rules, templatePrompt, variableListsText, safetyIdentifier) {
-  const variableInstructions = buildVariableInstructions(variableListsText);
+async function generateScenario(
+  apiKey,
+  rules,
+  templatePrompt,
+  variableListsText,
+  requestedSelections,
+  safetyIdentifier
+) {
+  const variableConfig = buildVariableInstructions(variableListsText, requestedSelections);
   const response = await fetch('https://api.openai.com/v1/responses', {
     method: 'POST',
     headers: {
@@ -568,8 +597,8 @@ async function generateScenario(apiKey, rules, templatePrompt, variableListsText
       reasoning: { effort: 'medium' },
       store: false,
       safety_identifier: safetyIdentifier,
-      instructions: variableInstructions
-        ? `${templatePrompt}\n\n${variableInstructions}`
+      instructions: variableConfig.instructions
+        ? `${templatePrompt}\n\n${variableConfig.instructions}`
         : templatePrompt,
       input: rules,
       max_output_tokens: 12000
@@ -591,7 +620,12 @@ async function generateScenario(apiKey, rules, templatePrompt, variableListsText
   const scenario = extractResponseText(data);
   if (!scenario) throw new Error('OpenAI returned an empty scenario');
 
-  return { scenario, responseId: data.id || null, usage: data.usage || null };
+  return {
+    scenario,
+    responseId: data.id || null,
+    usage: data.usage || null,
+    variables: variableConfig.selections
+  };
 }
 
 // ============================================
@@ -762,6 +796,9 @@ app.post('/generate-scenario', async (req, res) => {
   const variableListsText = typeof req.body?.variableLists === 'string'
     ? req.body.variableLists.trim()
     : '';
+  const variableSelections = req.body?.variableSelections && typeof req.body.variableSelections === 'object'
+    ? req.body.variableSelections
+    : {};
   const clientIp = req.ip || req.connection.remoteAddress || 'unknown';
 
   if (!rules) {
@@ -806,6 +843,7 @@ app.post('/generate-scenario', async (req, res) => {
         rules,
         templatePrompt,
         variableListsText,
+        variableSelections,
         safetyIdentifier
       );
       keyPool.markKeySuccess(apiKey);
@@ -814,6 +852,7 @@ app.post('/generate-scenario', async (req, res) => {
         model: 'gpt-5.6-sol',
         responseId: result.responseId,
         usage: result.usage,
+        variables: result.variables,
         rateLimit: { remaining: rateCheck.remaining, resetAt: rateCheck.resetAt }
       });
     } catch (error) {
