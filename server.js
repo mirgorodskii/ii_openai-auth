@@ -584,6 +584,8 @@ async function generateScenario(
   variableListsText,
   requestedSelections,
   referenceScenario,
+  existingScenario,
+  revisionComment,
   safetyIdentifier
 ) {
   const variableConfig = buildVariableInstructions(variableListsText, requestedSelections);
@@ -597,13 +599,22 @@ async function generateScenario(
       referenceScenario
     ].join('\n'));
   }
+  if (existingScenario && revisionComment) {
+    instructionParts.push([
+      'SCENARIO REVISION TASK:',
+      'Revise the supplied scenario according to the user comment.',
+      'Return the complete revised scenario only, preserving the application format. Do not return a patch, explanation, Markdown fence, or commentary.'
+    ].join('\n'));
+  }
   const instructions = instructionParts.join('\n\n');
   const requestBody = {
     model: 'gpt-5.6-sol',
     reasoning: { effort: 'medium' },
     store: false,
     safety_identifier: safetyIdentifier,
-    input: rules || 'Generate one complete interactive voice scenario.',
+    input: existingScenario && revisionComment
+      ? `CURRENT SCENARIO:\n${existingScenario}\n\nREVISION COMMENT:\n${revisionComment}`
+      : (rules || 'Generate one complete interactive voice scenario.'),
     max_output_tokens: 12000
   };
   if (instructions) requestBody.instructions = instructions;
@@ -812,6 +823,12 @@ app.post('/generate-scenario', async (req, res) => {
   const referenceScenario = typeof req.body?.referenceScenario === 'string'
     ? req.body.referenceScenario.trim()
     : '';
+  const existingScenario = typeof req.body?.existingScenario === 'string'
+    ? req.body.existingScenario.trim()
+    : '';
+  const revisionComment = typeof req.body?.revisionComment === 'string'
+    ? req.body.revisionComment.trim()
+    : '';
   const clientIp = req.ip || req.connection.remoteAddress || 'unknown';
 
   if (rules.length > 20000) {
@@ -825,6 +842,15 @@ app.post('/generate-scenario', async (req, res) => {
   }
   if (referenceScenario.length > 50000) {
     return res.status(400).json({ error: 'Reference scenario is too long', code: 'REFERENCE_TOO_LONG' });
+  }
+  if ((existingScenario && !revisionComment) || (!existingScenario && revisionComment)) {
+    return res.status(400).json({ error: 'Both scenario and revision comment are required', code: 'INCOMPLETE_REVISION' });
+  }
+  if (existingScenario.length > 100000) {
+    return res.status(400).json({ error: 'Scenario is too long', code: 'SCENARIO_TOO_LONG' });
+  }
+  if (revisionComment.length > 10000) {
+    return res.status(400).json({ error: 'Revision comment is too long', code: 'COMMENT_TOO_LONG' });
   }
 
   const rateCheck = checkRateLimit(clientIp, 'scenario-generator');
@@ -858,6 +884,8 @@ app.post('/generate-scenario', async (req, res) => {
         variableListsText,
         variableSelections,
         referenceScenario,
+        existingScenario,
+        revisionComment,
         safetyIdentifier
       );
       keyPool.markKeySuccess(apiKey);
