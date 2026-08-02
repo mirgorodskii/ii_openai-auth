@@ -511,6 +511,12 @@ function validateShapeResult(shape) {
   if (/[\r\n;`]/.test(expression) || /[\r\n;`]/.test(material)) {
     throw new Error('Shape contains forbidden characters');
   }
+  if (![...'xyz'].every((axis) => new RegExp(`\\b${axis}\\b`).test(expression))) {
+    throw new Error('Shape expression must use x, y, and z');
+  }
+  if (!/[<>=]/.test(expression)) {
+    throw new Error('Shape expression must contain a comparison');
+  }
 
   return { expression, material, description };
 }
@@ -524,13 +530,16 @@ async function generateShape(apiKey, prompt, safetyIdentifier) {
     },
     body: JSON.stringify({
       model: 'gpt-5.6-sol',
-      reasoning: { effort: 'low' },
+      reasoning: { effort: 'medium' },
       store: false,
       safety_identifier: safetyIdentifier,
       instructions: [
         'Create one WorldEdit //generate expression from the user description.',
-        'Use only variables x, y, z and functions supported by WorldEdit expressions.',
-        'The expression must evaluate to true inside the requested shape.',
+        'The command will run without -c, -o, or -r, so x, y, and z are normalized independently to the range -1 through 1 across the selection.',
+        'Build the requested object to occupy most of that normalized selection; never use dimensions measured in blocks.',
+        'Use x, y, and z in every expression and only functions supported by WorldEdit expressions.',
+        'The expression must evaluate to true for a meaningful volume inside the requested 3D shape and false outside it.',
+        'Before answering, mentally test several representative points in the -1 through 1 cube and correct empty, tiny, or all-true expressions.',
         'Do not include commands, Markdown, comments, semicolons, or line breaks.',
         'Choose a valid Minecraft block ID without a leading minecraft: prefix.',
         'Keep the formula practical for a selected region and describe it briefly in Russian.'
@@ -973,7 +982,8 @@ app.post('/generate-scenario', async (req, res) => {
     .createHash('sha256')
     .update(`scenario-generator:${clientIp}`)
     .digest('hex');
-  const maxAttempts = Math.min(3, healthyKeys.length);
+  // Retry malformed or unsuitable model output even when the pool contains one key.
+  const maxAttempts = 3;
   let lastError = null;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
