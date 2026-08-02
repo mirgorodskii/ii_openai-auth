@@ -545,7 +545,9 @@ async function generateShape(apiKey, prompt, safetyIdentifier) {
         'Keep the formula practical for a selected region and describe it briefly in Russian.'
       ].join(' '),
       input: prompt,
-      max_output_tokens: 1200,
+      // Reasoning tokens count against this budget. Keep enough room for the
+      // strict JSON answer after medium-effort formula validation.
+      max_output_tokens: 4000,
       text: {
         format: {
           type: 'json_schema',
