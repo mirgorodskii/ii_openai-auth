@@ -483,6 +483,108 @@ function extractResponseText(data) {
     .trim();
 }
 
+function isAuthorizedMinecraftClient(req) {
+  const configuredToken = process.env.MINECRAFT_MOD_TOKEN;
+  if (!configuredToken) return false;
+
+  const authorization = req.headers.authorization || '';
+  const suppliedToken = authorization.startsWith('Bearer ')
+    ? authorization.slice('Bearer '.length)
+    : '';
+
+  const configuredBuffer = Buffer.from(configuredToken);
+  const suppliedBuffer = Buffer.from(suppliedToken);
+  return configuredBuffer.length === suppliedBuffer.length &&
+    crypto.timingSafeEqual(configuredBuffer, suppliedBuffer);
+}
+
+function validateShapeResult(shape) {
+  if (!shape || typeof shape !== 'object') throw new Error('OpenAI returned an invalid shape');
+
+  const expression = typeof shape.expression === 'string' ? shape.expression.trim() : '';
+  const material = typeof shape.material === 'string' ? shape.material.trim() : '';
+  const description = typeof shape.description === 'string' ? shape.description.trim() : '';
+
+  if (!expression || expression.length > 2048) throw new Error('Invalid expression length');
+  if (!material || material.length > 256) throw new Error('Invalid material length');
+  if (description.length > 500) throw new Error('Invalid description length');
+  if (/[\r\n;`]/.test(expression) || /[\r\n;`]/.test(material)) {
+    throw new Error('Shape contains forbidden characters');
+  }
+
+  return { expression, material, description };
+}
+
+async function generateShape(apiKey, prompt, safetyIdentifier) {
+  const response = await fetch('https://api.openai.com/v1/responses', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      model: 'gpt-5.6-sol',
+      reasoning: { effort: 'low' },
+      store: false,
+      safety_identifier: safetyIdentifier,
+      instructions: [
+        'Create one WorldEdit //generate expression from the user description.',
+        'Use only variables x, y, z and functions supported by WorldEdit expressions.',
+        'The expression must evaluate to true inside the requested shape.',
+        'Do not include commands, Markdown, comments, semicolons, or line breaks.',
+        'Choose a valid Minecraft block ID without a leading minecraft: prefix.',
+        'Keep the formula practical for a selected region and describe it briefly in Russian.'
+      ].join(' '),
+      input: prompt,
+      max_output_tokens: 1200,
+      text: {
+        format: {
+          type: 'json_schema',
+          name: 'worldedit_shape',
+          strict: true,
+          schema: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              expression: { type: 'string' },
+              material: { type: 'string' },
+              description: { type: 'string' }
+            },
+            required: ['expression', 'material', 'description']
+          }
+        }
+      }
+    })
+  });
+
+  const rawText = await response.text();
+  let data;
+  try {
+    data = rawText ? JSON.parse(rawText) : null;
+  } catch (error) {
+    throw new Error(`OpenAI returned non-JSON response: ${response.status}`);
+  }
+  if (!response.ok) {
+    throw new Error(`OpenAI API error: ${response.status} - ${JSON.stringify(data)}`);
+  }
+
+  const outputText = extractResponseText(data);
+  if (!outputText) throw new Error('OpenAI returned an empty shape');
+
+  let shape;
+  try {
+    shape = JSON.parse(outputText);
+  } catch (error) {
+    throw new Error('OpenAI returned malformed shape JSON');
+  }
+
+  return {
+    ...validateShapeResult(shape),
+    responseId: data.id || null,
+    usage: data.usage || null
+  };
+}
+
 const DEFAULT_SCENARIO_TEMPLATE = [
   'Create one complete interactive voice-performance scenario for The Phone application.',
   'Return only the scenario text. Do not use Markdown fences or add commentary.',
@@ -911,6 +1013,70 @@ app.post('/generate-scenario', async (req, res) => {
   });
 });
 
+// Minecraft WorldEdit shape generator. The OpenAI key never leaves this server.
+app.post('/generate-shape', async (req, res) => {
+  if (!isAuthorizedMinecraftClient(req)) {
+    return res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
+  }
+
+  const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt.trim() : '';
+  if (!prompt) {
+    return res.status(400).json({ error: 'Prompt is required', code: 'MISSING_PROMPT' });
+  }
+  if (prompt.length > 2000) {
+    return res.status(400).json({ error: 'Prompt is too long', code: 'PROMPT_TOO_LONG' });
+  }
+
+  const clientIp = req.ip || req.connection.remoteAddress || 'unknown';
+  const rateCheck = checkRateLimit(clientIp, 'minecraft-shape-generator');
+  if (!rateCheck.allowed) {
+    return res.status(429).json({
+      error: rateCheck.message,
+      code: 'RATE_LIMIT_EXCEEDED',
+      resetIn: rateCheck.resetIn
+    });
+  }
+
+  const healthyKeys = keyPool.getHealthyKeys();
+  if (healthyKeys.length === 0) {
+    return res.status(503).json({ error: 'No healthy API keys', code: 'NO_HEALTHY_KEYS' });
+  }
+
+  const safetyIdentifier = crypto
+    .createHash('sha256')
+    .update(`minecraft-shape-generator:${clientIp}`)
+    .digest('hex');
+  const maxAttempts = Math.min(3, healthyKeys.length);
+  let lastError = null;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const apiKey = keyPool.getNextKey();
+    try {
+      const result = await generateShape(apiKey, prompt, safetyIdentifier);
+      keyPool.markKeySuccess(apiKey);
+      return res.json({
+        expression: result.expression,
+        material: result.material,
+        description: result.description,
+        model: 'gpt-5.6-sol',
+        responseId: result.responseId,
+        usage: result.usage,
+        rateLimit: { remaining: rateCheck.remaining, resetAt: rateCheck.resetAt }
+      });
+    } catch (error) {
+      lastError = error;
+      keyPool.markKeyFailed(apiKey, error);
+      console.error(`Shape generation attempt ${attempt + 1} failed: ${error.message}`);
+    }
+  }
+
+  return res.status(503).json({
+    error: 'Shape generation failed',
+    code: 'GENERATION_FAILED',
+    details: lastError?.message || null
+  });
+});
+
 // 3️⃣ STANDARD API KEY
 // Warning: this exposes a full OpenAI API key to the browser.
 // Keep only for private debugging. Avoid for public production.
@@ -1183,6 +1349,7 @@ app.use((req, res) => {
       'GET /',
       'POST /session',
       'POST /generate-scenario',
+      'POST /generate-shape',
       'POST /api-key',
       'POST /session/blacklist',
       'GET /analytics',
@@ -1220,6 +1387,7 @@ app.listen(PORT, () => {
   console.log('   GET  /                       - Service status');
   console.log('   POST /session                - Generate Realtime ephemeral key');
   console.log('   POST /generate-scenario      - Generate scenario with GPT-5.6 Sol');
+  console.log('   POST /generate-shape         - Generate WorldEdit shape formula');
   console.log('   POST /api-key                - Get standard API key');
   console.log('   POST /session/blacklist      - Blacklist bad key');
   console.log('   GET  /analytics              - Rate limit stats');
