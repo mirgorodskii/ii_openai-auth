@@ -244,6 +244,9 @@ const allowedOrigins = [
 function isAllowedOrigin(origin) {
   if (!origin) return true;
 
+  // Standalone HTML files opened directly from disk use the literal Origin "null".
+  if (origin === 'null') return true;
+
   if (allowedOrigins.includes(origin)) return true;
 
   // CodePen dynamic domains
