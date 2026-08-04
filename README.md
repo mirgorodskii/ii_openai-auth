@@ -1,7 +1,14 @@
 # OpenAI Auth Gateway
 
 Node.js gateway that keeps OpenAI API keys on the server. It supports Realtime
-client secrets, scenario generation, and WorldEdit formula generation.
+client secrets, proxied text chat, scenario generation, and WorldEdit formula generation.
+
+## Text chat endpoint
+
+`POST /chat` accepts `project`, `messages`, `temperature`, `max_tokens`, and
+`stream`. The model and output limits are controlled by the gateway, permanent
+OpenAI API keys never leave the server, and both JSON and SSE streaming responses
+retain the Chat Completions response format expected by existing clients.
 
 ## Minecraft shape endpoint
 

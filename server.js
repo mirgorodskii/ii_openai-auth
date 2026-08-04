@@ -233,6 +233,8 @@ const rateLimitStore = new Map();
 const allowedOrigins = [
   'http://localhost:8000',
   'http://localhost:3000',
+  'http://localhost:8765',
+  'http://127.0.0.1:8765',
   'https://yourdomain.com',
   'https://cdpn.io',
   'https://codepen.io',
@@ -771,14 +773,15 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'OpenAI Auth Gateway',
-    version: '3.1.0',
+    version: '3.2.0',
     features: [
       'realtime-client-secrets',
       'ephemeral-keys',
       'multi-key-failover',
       'client-blacklist',
       'debug-details',
-      'fixed-audio-output-voice'
+      'fixed-audio-output-voice',
+      'text-chat-proxy'
     ],
     model: process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime-2.1',
     keysLoaded: keyPool.keys.length,
@@ -919,6 +922,118 @@ app.post('/session', async (req, res) => {
       message: error.message
     });
   }
+});
+
+// Text chat proxy. The browser never receives a permanent OpenAI API key.
+app.post('/chat', async (req, res) => {
+  const project = typeof req.body?.project === 'string'
+    ? req.body.project.trim().slice(0, 80)
+    : 'octologue-3d-scene';
+  const messages = req.body?.messages;
+  const stream = req.body?.stream === true;
+  const temperature = Number.isFinite(req.body?.temperature)
+    ? Math.min(2, Math.max(0, req.body.temperature))
+    : 0.7;
+  const maxTokens = Number.isFinite(req.body?.max_tokens)
+    ? Math.min(600, Math.max(1, Math.floor(req.body.max_tokens)))
+    : 500;
+
+  if (!Array.isArray(messages) || messages.length < 1 || messages.length > 20) {
+    return res.status(400).json({ error: 'Messages must contain 1 to 20 items', code: 'INVALID_MESSAGES' });
+  }
+
+  const allowedRoles = new Set(['system', 'user', 'assistant']);
+  let totalCharacters = 0;
+  const normalizedMessages = [];
+  for (const message of messages) {
+    if (!message || !allowedRoles.has(message.role) || typeof message.content !== 'string') {
+      return res.status(400).json({ error: 'Invalid message', code: 'INVALID_MESSAGE' });
+    }
+    totalCharacters += message.content.length;
+    normalizedMessages.push({ role: message.role, content: message.content });
+  }
+  if (totalCharacters > 30000) {
+    return res.status(400).json({ error: 'Conversation is too long', code: 'MESSAGES_TOO_LONG' });
+  }
+
+  const clientIp = req.ip || req.connection.remoteAddress || 'unknown';
+  const rateCheck = checkRateLimit(clientIp, project || 'octologue-3d-scene');
+  if (!rateCheck.allowed) {
+    return res.status(429).json({
+      error: rateCheck.message,
+      code: 'RATE_LIMIT_EXCEEDED',
+      resetIn: rateCheck.resetIn
+    });
+  }
+
+  const healthyKeys = keyPool.getHealthyKeys();
+  if (healthyKeys.length === 0) {
+    return res.status(503).json({ error: 'No healthy API keys', code: 'NO_HEALTHY_KEYS' });
+  }
+
+  const maxAttempts = Math.min(3, healthyKeys.length);
+  let lastError = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const apiKey = keyPool.getNextKey();
+    try {
+      const openAIResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o',
+          temperature,
+          max_tokens: maxTokens,
+          stream,
+          messages: normalizedMessages
+        })
+      });
+
+      if (!openAIResponse.ok) {
+        const details = await openAIResponse.text();
+        const error = new Error(`OpenAI API error: ${openAIResponse.status} - ${details}`);
+        if ([401, 403, 429].includes(openAIResponse.status)) keyPool.markKeyFailed(apiKey, error);
+        lastError = error;
+        if (attempt < maxAttempts - 1 && [401, 403, 429, 500, 502, 503, 504].includes(openAIResponse.status)) {
+          continue;
+        }
+        return res.status(openAIResponse.status).json({ error: 'OpenAI request failed', code: 'OPENAI_ERROR' });
+      }
+
+      keyPool.markKeySuccess(apiKey);
+      res.setHeader('X-RateLimit-Remaining', String(rateCheck.remaining));
+
+      if (!stream) {
+        const data = await openAIResponse.json();
+        return res.json(data);
+      }
+
+      res.status(200);
+      res.setHeader('Content-Type', openAIResponse.headers.get('content-type') || 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      const reader = openAIResponse.body.getReader();
+      req.on('close', () => reader.cancel().catch(() => {}));
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        res.write(Buffer.from(value));
+      }
+      return res.end();
+    } catch (error) {
+      lastError = error;
+      keyPool.markKeyFailed(apiKey, error);
+      if (res.headersSent) return res.end();
+    }
+  }
+
+  return res.status(503).json({
+    error: 'Text chat is temporarily unavailable',
+    code: 'CHAT_UNAVAILABLE',
+    details: shouldExposeDebug(req) ? lastError?.message : undefined
+  });
 });
 
 // 2️⃣ SCENARIO GENERATOR (server-side Responses API; API key is never exposed)
@@ -1360,6 +1475,7 @@ app.use((req, res) => {
     availableEndpoints: [
       'GET /',
       'POST /session',
+      'POST /chat',
       'POST /generate-scenario',
       'POST /generate-shape',
       'POST /api-key',
@@ -1387,7 +1503,7 @@ app.use((err, req, res, next) => {
 // ============================================
 
 app.listen(PORT, () => {
-  console.log('🚀 OpenAI Auth Gateway v3.1 - Realtime client_secrets');
+  console.log('🚀 OpenAI Auth Gateway v3.2 - Realtime auth and text chat proxy');
   console.log(`📡 Server running on port ${PORT}`);
   console.log(`🔑 API Keys loaded: ${keyPool.keys.length}`);
   console.log(`✅ Healthy keys: ${keyPool.getHealthyKeys().length}`);
@@ -1398,6 +1514,7 @@ app.listen(PORT, () => {
   console.log('\n📊 Endpoints:');
   console.log('   GET  /                       - Service status');
   console.log('   POST /session                - Generate Realtime ephemeral key');
+  console.log('   POST /chat                   - Proxy text chat without exposing API keys');
   console.log('   POST /generate-scenario      - Generate scenario with GPT-5.6 Sol');
   console.log('   POST /generate-shape         - Generate WorldEdit shape formula');
   console.log('   POST /api-key                - Get standard API key');
