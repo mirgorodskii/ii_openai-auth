@@ -5,6 +5,7 @@
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
+const multer = require('multer');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -225,6 +226,10 @@ class APIKeyPool {
 
 const keyPool = new APIKeyPool();
 const rateLimitStore = new Map();
+const audioUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024, files: 1 }
+});
 
 // ============================================
 // CORS
@@ -776,7 +781,7 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'OpenAI Auth Gateway',
-    version: '3.2.0',
+    version: '3.3.0',
     features: [
       'realtime-client-secrets',
       'ephemeral-keys',
@@ -784,7 +789,8 @@ app.get('/', (req, res) => {
       'client-blacklist',
       'debug-details',
       'fixed-audio-output-voice',
-      'text-chat-proxy'
+      'text-chat-proxy',
+      'audio-transcription-proxy'
     ],
     model: process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime-2.1',
     keysLoaded: keyPool.keys.length,
@@ -1035,6 +1041,82 @@ app.post('/chat', async (req, res) => {
   return res.status(503).json({
     error: 'Text chat is temporarily unavailable',
     code: 'CHAT_UNAVAILABLE',
+    details: shouldExposeDebug(req) ? lastError?.message : undefined
+  });
+});
+
+// Speech-to-text proxy for short push-to-talk recordings.
+app.post('/transcribe', audioUpload.single('audio'), async (req, res) => {
+  if (!req.file?.buffer?.length) {
+    return res.status(400).json({ error: 'Audio file is required', code: 'MISSING_AUDIO' });
+  }
+
+  const project = typeof req.body?.project === 'string'
+    ? req.body.project.trim().slice(0, 80)
+    : 'octologue-3d-scene';
+  const clientIp = req.ip || req.connection.remoteAddress || 'unknown';
+  const rateCheck = checkRateLimit(clientIp, `${project}:transcription`);
+  if (!rateCheck.allowed) {
+    return res.status(429).json({
+      error: rateCheck.message,
+      code: 'RATE_LIMIT_EXCEEDED',
+      resetIn: rateCheck.resetIn
+    });
+  }
+
+  const healthyKeys = keyPool.getHealthyKeys();
+  if (healthyKeys.length === 0) {
+    return res.status(503).json({ error: 'No healthy API keys', code: 'NO_HEALTHY_KEYS' });
+  }
+
+  const mimeType = req.file.mimetype || 'audio/webm';
+  const extension = mimeType.includes('ogg') ? 'ogg'
+    : mimeType.includes('mp4') ? 'm4a'
+      : mimeType.includes('wav') ? 'wav'
+        : 'webm';
+  const maxAttempts = Math.min(3, healthyKeys.length);
+  let lastError = null;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const apiKey = keyPool.getNextKey();
+    try {
+      const form = new FormData();
+      form.append('model', 'gpt-4o-mini-transcribe');
+      form.append('file', new Blob([req.file.buffer], { type: mimeType }), `recording.${extension}`);
+
+      const openAIResponse = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${apiKey}` },
+        body: form
+      });
+      const rawText = await openAIResponse.text();
+
+      if (!openAIResponse.ok) {
+        const error = new Error(`OpenAI transcription error: ${openAIResponse.status} - ${rawText}`);
+        if ([401, 403, 429].includes(openAIResponse.status)) keyPool.markKeyFailed(apiKey, error);
+        lastError = error;
+        if (attempt < maxAttempts - 1 && [401, 403, 429, 500, 502, 503, 504].includes(openAIResponse.status)) {
+          continue;
+        }
+        return res.status(openAIResponse.status).json({ error: 'Transcription failed', code: 'OPENAI_ERROR' });
+      }
+
+      const data = rawText ? JSON.parse(rawText) : {};
+      keyPool.markKeySuccess(apiKey);
+      return res.json({
+        text: typeof data.text === 'string' ? data.text.trim() : '',
+        model: 'gpt-4o-mini-transcribe',
+        rateLimit: { remaining: rateCheck.remaining, resetAt: rateCheck.resetAt }
+      });
+    } catch (error) {
+      lastError = error;
+      keyPool.markKeyFailed(apiKey, error);
+    }
+  }
+
+  return res.status(503).json({
+    error: 'Transcription is temporarily unavailable',
+    code: 'TRANSCRIPTION_UNAVAILABLE',
     details: shouldExposeDebug(req) ? lastError?.message : undefined
   });
 });
@@ -1479,6 +1561,7 @@ app.use((req, res) => {
       'GET /',
       'POST /session',
       'POST /chat',
+      'POST /transcribe',
       'POST /generate-scenario',
       'POST /generate-shape',
       'POST /api-key',
@@ -1506,7 +1589,7 @@ app.use((err, req, res, next) => {
 // ============================================
 
 app.listen(PORT, () => {
-  console.log('🚀 OpenAI Auth Gateway v3.2 - Realtime auth and text chat proxy');
+  console.log('🚀 OpenAI Auth Gateway v3.3 - Realtime, text chat, and transcription proxy');
   console.log(`📡 Server running on port ${PORT}`);
   console.log(`🔑 API Keys loaded: ${keyPool.keys.length}`);
   console.log(`✅ Healthy keys: ${keyPool.getHealthyKeys().length}`);
@@ -1518,6 +1601,7 @@ app.listen(PORT, () => {
   console.log('   GET  /                       - Service status');
   console.log('   POST /session                - Generate Realtime ephemeral key');
   console.log('   POST /chat                   - Proxy text chat without exposing API keys');
+  console.log('   POST /transcribe             - Transcribe push-to-talk audio');
   console.log('   POST /generate-scenario      - Generate scenario with GPT-5.6 Sol');
   console.log('   POST /generate-shape         - Generate WorldEdit shape formula');
   console.log('   POST /api-key                - Get standard API key');

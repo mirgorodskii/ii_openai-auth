@@ -10,6 +10,12 @@ client secrets, proxied text chat, scenario generation, and WorldEdit formula ge
 OpenAI API keys never leave the server, and both JSON and SSE streaming responses
 retain the Chat Completions response format expected by existing clients.
 
+## Audio transcription endpoint
+
+`POST /transcribe` accepts a multipart `audio` file of up to 15 MB and an
+optional `project` field. The gateway sends it to `gpt-4o-mini-transcribe` and
+returns `{ "text": "..." }` without exposing a permanent OpenAI API key.
+
 ## Minecraft shape endpoint
 
 Set these deployment environment variables:
