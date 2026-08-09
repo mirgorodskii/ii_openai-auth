@@ -15,7 +15,10 @@ const PORT = process.env.PORT || 3000;
 // ============================================
 
 class APIKeyPool {
-  constructor() {
+  constructor(envPrefix = 'OPENAI_API_KEY', { name = 'default', allowFallback = true } = {}) {
+    this.envPrefix = envPrefix;
+    this.name = name;
+    this.allowFallback = allowFallback;
     this.keys = [];
     this.keyStatus = new Map();
     this.currentIndex = 0;
@@ -30,7 +33,7 @@ class APIKeyPool {
 
   _loadKeys() {
     for (let i = 1; i <= 10; i++) {
-      const key = process.env[`OPENAI_API_KEY_${i}`];
+      const key = process.env[`${this.envPrefix}_${i}`];
 
       if (key && key.startsWith('sk-')) {
         this.keys.push(key);
@@ -44,8 +47,8 @@ class APIKeyPool {
       }
     }
 
-    if (this.keys.length === 0) {
-      const fallbackKey = process.env.OPENAI_API_KEY;
+    if (this.keys.length === 0 && this.allowFallback) {
+      const fallbackKey = process.env[this.envPrefix];
 
       if (fallbackKey && fallbackKey.startsWith('sk-')) {
         this.keys.push(fallbackKey);
@@ -64,6 +67,32 @@ class APIKeyPool {
     this.keys.forEach((key, idx) => {
       console.log(`   Key ${idx + 1}: ${this._labelKey(key)}`);
     });
+  }
+
+  async checkAllKeys() {
+    const results = [];
+
+    for (const key of this.keys) {
+      const status = this.keyStatus.get(key);
+      try {
+        const response = await fetch('https://api.openai.com/v1/models', {
+          headers: { Authorization: `Bearer ${key}` }
+        });
+        const details = await response.text();
+        status.healthy = response.ok;
+        status.lastCheck = Date.now();
+        status.lastError = response.ok ? null : `HTTP ${response.status}: ${details}`;
+        if (response.ok) status.failCount = 0;
+        results.push({ healthy: response.ok, httpStatus: response.status });
+      } catch (error) {
+        status.healthy = false;
+        status.lastCheck = Date.now();
+        status.lastError = error.message;
+        results.push({ healthy: false, error: error.message });
+      }
+    }
+
+    return results;
   }
 
   _startHealthMonitor() {
@@ -225,6 +254,17 @@ class APIKeyPool {
 }
 
 const keyPool = new APIKeyPool();
+const athKeyPool = new APIKeyPool('OPENAI_API_KEY_ATH', {
+  name: 'ath',
+  allowFallback: false
+});
+const projectKeyPools = new Map([
+  ['concept-split-lidar', athKeyPool]
+]);
+
+function getKeyPoolForProject(project) {
+  return projectKeyPools.get(project) || keyPool;
+}
 const rateLimitStore = new Map();
 const audioUpload = multer({
   storage: multer.memoryStorage(),
@@ -795,6 +835,16 @@ app.get('/', (req, res) => {
     model: process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime-2.1',
     keysLoaded: keyPool.keys.length,
     healthyKeys: keyPool.getHealthyKeys().length,
+    keyPools: {
+      default: {
+        loaded: keyPool.keys.length,
+        healthy: keyPool.getHealthyKeys().length
+      },
+      ath: {
+        loaded: athKeyPool.keys.length,
+        healthy: athKeyPool.getHealthyKeys().length
+      }
+    },
     timestamp: new Date().toISOString()
   });
 });
@@ -975,15 +1025,19 @@ app.post('/chat', async (req, res) => {
     });
   }
 
-  const healthyKeys = keyPool.getHealthyKeys();
+  const requestKeyPool = getKeyPoolForProject(project);
+  const healthyKeys = requestKeyPool.getHealthyKeys();
   if (healthyKeys.length === 0) {
-    return res.status(503).json({ error: 'No healthy API keys', code: 'NO_HEALTHY_KEYS' });
+    return res.status(503).json({
+      error: `No healthy API keys in ${requestKeyPool.name} pool`,
+      code: 'NO_HEALTHY_KEYS'
+    });
   }
 
   const maxAttempts = Math.min(3, healthyKeys.length);
   let lastError = null;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const apiKey = keyPool.getNextKey();
+    const apiKey = requestKeyPool.getNextKey();
     try {
       const openAIResponse = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
@@ -1003,7 +1057,7 @@ app.post('/chat', async (req, res) => {
       if (!openAIResponse.ok) {
         const details = await openAIResponse.text();
         const error = new Error(`OpenAI API error: ${openAIResponse.status} - ${details}`);
-        if ([401, 403, 429].includes(openAIResponse.status)) keyPool.markKeyFailed(apiKey, error);
+        if ([401, 403, 429].includes(openAIResponse.status)) requestKeyPool.markKeyFailed(apiKey, error);
         lastError = error;
         if (attempt < maxAttempts - 1 && [401, 403, 429, 500, 502, 503, 504].includes(openAIResponse.status)) {
           continue;
@@ -1011,8 +1065,9 @@ app.post('/chat', async (req, res) => {
         return res.status(openAIResponse.status).json({ error: 'OpenAI request failed', code: 'OPENAI_ERROR' });
       }
 
-      keyPool.markKeySuccess(apiKey);
+      requestKeyPool.markKeySuccess(apiKey);
       res.setHeader('X-RateLimit-Remaining', String(rateCheck.remaining));
+      res.setHeader('X-Key-Pool', requestKeyPool.name);
 
       if (!stream) {
         const data = await openAIResponse.json();
@@ -1033,7 +1088,7 @@ app.post('/chat', async (req, res) => {
       return res.end();
     } catch (error) {
       lastError = error;
-      keyPool.markKeyFailed(apiKey, error);
+      requestKeyPool.markKeyFailed(apiKey, error);
       if (res.headersSent) return res.end();
     }
   }
@@ -1064,9 +1119,13 @@ app.post('/transcribe', audioUpload.single('audio'), async (req, res) => {
     });
   }
 
-  const healthyKeys = keyPool.getHealthyKeys();
+  const requestKeyPool = getKeyPoolForProject(project);
+  const healthyKeys = requestKeyPool.getHealthyKeys();
   if (healthyKeys.length === 0) {
-    return res.status(503).json({ error: 'No healthy API keys', code: 'NO_HEALTHY_KEYS' });
+    return res.status(503).json({
+      error: `No healthy API keys in ${requestKeyPool.name} pool`,
+      code: 'NO_HEALTHY_KEYS'
+    });
   }
 
   const mimeType = req.file.mimetype || 'audio/webm';
@@ -1078,7 +1137,7 @@ app.post('/transcribe', audioUpload.single('audio'), async (req, res) => {
   let lastError = null;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const apiKey = keyPool.getNextKey();
+    const apiKey = requestKeyPool.getNextKey();
     try {
       const form = new FormData();
       form.append('model', 'gpt-4o-mini-transcribe');
@@ -1093,7 +1152,7 @@ app.post('/transcribe', audioUpload.single('audio'), async (req, res) => {
 
       if (!openAIResponse.ok) {
         const error = new Error(`OpenAI transcription error: ${openAIResponse.status} - ${rawText}`);
-        if ([401, 403, 429].includes(openAIResponse.status)) keyPool.markKeyFailed(apiKey, error);
+        if ([401, 403, 429].includes(openAIResponse.status)) requestKeyPool.markKeyFailed(apiKey, error);
         lastError = error;
         if (attempt < maxAttempts - 1 && [401, 403, 429, 500, 502, 503, 504].includes(openAIResponse.status)) {
           continue;
@@ -1102,7 +1161,8 @@ app.post('/transcribe', audioUpload.single('audio'), async (req, res) => {
       }
 
       const data = rawText ? JSON.parse(rawText) : {};
-      keyPool.markKeySuccess(apiKey);
+      requestKeyPool.markKeySuccess(apiKey);
+      res.setHeader('X-Key-Pool', requestKeyPool.name);
       return res.json({
         text: typeof data.text === 'string' ? data.text.trim() : '',
         model: 'gpt-4o-mini-transcribe',
@@ -1110,7 +1170,7 @@ app.post('/transcribe', audioUpload.single('audio'), async (req, res) => {
       });
     } catch (error) {
       lastError = error;
-      keyPool.markKeyFailed(apiKey, error);
+      requestKeyPool.markKeyFailed(apiKey, error);
     }
   }
 
@@ -1412,10 +1472,12 @@ app.get('/analytics', (req, res) => {
 
 // 5️⃣ KEYS HEALTH
 app.get('/keys/health', (req, res) => {
-  const stats = keyPool.getStats();
+  const requestedPool = req.query.pool === 'ath' ? athKeyPool : keyPool;
+  const stats = requestedPool.getStats();
 
   res.json({
     timestamp: new Date().toISOString(),
+    pool: requestedPool.name,
     summary: {
       total: stats.total,
       healthy: stats.healthy,
@@ -1593,6 +1655,7 @@ app.listen(PORT, () => {
   console.log(`📡 Server running on port ${PORT}`);
   console.log(`🔑 API Keys loaded: ${keyPool.keys.length}`);
   console.log(`✅ Healthy keys: ${keyPool.getHealthyKeys().length}`);
+  console.log(`🔑 ATH API Keys loaded: ${athKeyPool.keys.length}`);
   console.log(`🧠 Realtime model: ${process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime-2.1'}`);
   console.log(`🛡️ CORS enabled for: ${allowedOrigins.join(', ')}`);
   console.log(`⏰ Time: ${new Date().toISOString()}`);
@@ -1611,6 +1674,13 @@ app.listen(PORT, () => {
   console.log('   POST /keys/check             - Manual health check');
   console.log('   POST /keys/recover           - Recover specific key');
   console.log('   POST /admin/reset-limits     - Reset rate limits');
+
+  Promise.all([keyPool.checkAllKeys(), athKeyPool.checkAllKeys()])
+    .then(() => {
+      console.log(`✅ Default pool verified: ${keyPool.getHealthyKeys().length}/${keyPool.keys.length}`);
+      console.log(`✅ ATH pool verified: ${athKeyPool.getHealthyKeys().length}/${athKeyPool.keys.length}`);
+    })
+    .catch((error) => console.error(`❌ Startup key verification failed: ${error.message}`));
 });
 
 process.on('SIGTERM', () => {
