@@ -15,7 +15,8 @@ const PORT = process.env.PORT || 3000;
 // ============================================
 
 class APIKeyPool {
-  constructor(envPrefix = 'OPENAI_API_KEY', { name = 'default', allowFallback = true } = {}) {
+  constructor(envPrefix = 'OPENAI_API_KEY', { name = 'default', allowFallback = true, slots = [1,2,3,4,5,6,7,8,9,10] } = {}) {
+    this.slots = slots;
     this.envPrefix = envPrefix;
     this.name = name;
     this.allowFallback = allowFallback;
@@ -32,7 +33,7 @@ class APIKeyPool {
   }
 
   _loadKeys() {
-    for (let i = 1; i <= 10; i++) {
+    for (const i of this.slots) {
       const key = process.env[`${this.envPrefix}_${i}`];
 
       if (key && key.startsWith('sk-')) {
@@ -258,7 +259,11 @@ const athKeyPool = new APIKeyPool('OPENAI_API_KEY_ATH', {
   name: 'ath',
   allowFallback: false
 });
+const gardenKeyPool = new APIKeyPool('OPENAI_API_KEY_ATH', {
+  name: 'garden', slots: [4, 5, 6], allowFallback: false
+});
 const projectKeyPools = new Map([
+  ['octologue-3d-scene', gardenKeyPool],
   ['concept-split-lidar', athKeyPool]
 ]);
 
@@ -1472,7 +1477,7 @@ app.get('/analytics', (req, res) => {
 
 // 5️⃣ KEYS HEALTH
 app.get('/keys/health', (req, res) => {
-  const requestedPool = req.query.pool === 'ath' ? athKeyPool : keyPool;
+  const requestedPool = req.query.pool === 'garden' ? gardenKeyPool : req.query.pool === 'ath' ? athKeyPool : keyPool;
   const stats = requestedPool.getStats();
 
   res.json({
@@ -1675,7 +1680,7 @@ app.listen(PORT, () => {
   console.log('   POST /keys/recover           - Recover specific key');
   console.log('   POST /admin/reset-limits     - Reset rate limits');
 
-  Promise.all([keyPool.checkAllKeys(), athKeyPool.checkAllKeys()])
+  Promise.all([keyPool.checkAllKeys(), athKeyPool.checkAllKeys(), gardenKeyPool.checkAllKeys()])
     .then(() => {
       console.log(`✅ Default pool verified: ${keyPool.getHealthyKeys().length}/${keyPool.keys.length}`);
       console.log(`✅ ATH pool verified: ${athKeyPool.getHealthyKeys().length}/${athKeyPool.keys.length}`);
